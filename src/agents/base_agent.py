@@ -138,7 +138,7 @@ class BaseAgent(ToolCallingAgent, ABC):
         """Run a task using SmolAgents framework"""
         try:
             # Use SmolAgents to run the task (run() is synchronous in smolagents 1.26.0)
-            result = self.run(task_description, tools=tools)
+            result = self.run(task_description, max_steps=5)
             return {"success": True, "result": str(result)}
         except Exception as e:
             logger.error(f"SmolAgents task execution failed: {e}")

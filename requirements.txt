@@ -30,4 +30,4 @@ webdriver-manager==4.0.2
 chromedriver-autoinstaller==0.6.4
 yfinance==0.2.40
 financial-datasets==0.1.0
-smolagents==0.1.0
+smolagents==1.26.0

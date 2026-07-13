@@ -5,7 +5,7 @@ import json
 import logging
 from smolagents import Tool
 from smolagents.memory import AgentMemory
-from smolagents.models import OpenAIModel
+from smolagents.models import OpenAIModel, ChatMessage
 
 from .base_agent import BaseAgent, Task, TaskResult
 
@@ -123,16 +123,12 @@ class PlanningAgent(BaseAgent):
             planning_prompt = self._create_planning_prompt(research_topic, requirements, output_format)
             
             # Use the model directly with the planning prompt
-            response = await self.model.generate_response(planning_prompt)
+            messages = [ChatMessage(role="user", content=planning_prompt)]
+            response = self.model.generate(messages)
             
-            if not response.get("success"):
-                return TaskResult(
-                    task_id=task.id,
-                    success=False,
-                    error=response.get("error", "Unknown error")
-                )
-            
-            plan = self._parse_plan(response["content"])
+            # Extract text content from response
+            response_text = response.content if hasattr(response, 'content') else str(response)
+            plan = self._parse_plan(response_text)
             
             execution_time = (datetime.now() - start_time).total_seconds()
             
@@ -209,7 +205,15 @@ Ensure the tasks are logically ordered and dependencies are correctly specified.
     def _parse_plan(self, response_content: str) -> Dict[str, Any]:
         """Parse the model response into a structured plan"""
         try:
-            plan = json.loads(response_content)
+            # Strip markdown code fences if present
+            content = response_content.strip()
+            if content.startswith("```"):
+                lines = content.split("\n")
+                # Remove first and last lines (``` markers)
+                lines = [l for l in lines[1:] if not l.strip().startswith("```")]
+                content = "\n".join(lines)
+            
+            plan = json.loads(content)
             
             # Validate required fields
             required_fields = ["overview", "tasks", "expected_output"]

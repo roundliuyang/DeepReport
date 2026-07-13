@@ -8,7 +8,7 @@ import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from smolagents import Tool
-from smolagents.memory import ConversationMemory
+from smolagents.memory import AgentMemory
 from smolagents.models import OpenAIModel
 
 from .base_agent import BaseAgent, Task, TaskResult
@@ -19,38 +19,45 @@ class HTMLReportTool(Tool):
     """Tool for generating HTML reports"""
     
     def __init__(self):
-        super().__init__(
-            name="generate_html_report",
-            description="Generate comprehensive HTML financial reports",
-            parameters={
-                "report_data": {
-                    "type": "object",
-                    "description": "Report data and content"
-                },
-                "template_style": {
-                    "type": "string",
-                    "description": "Report template style",
-                    "enum": ["professional", "modern", "academic", "executive"],
-                    "default": "professional"
-                },
-                "include_charts": {
-                    "type": "boolean",
-                    "description": "Whether to include interactive charts",
-                    "default": True
-                },
-                "include_citations": {
-                    "type": "boolean",
-                    "description": "Whether to include citations and references",
-                    "default": True
-                }
+        super().__init__()
+        self.name = "generate_html_report"
+        self.description = "Generate comprehensive HTML financial reports"
+        self.inputs = {
+            "report_data": {
+                "type": "object",
+                "description": "Report data and content"
+            },
+            "template_style": {
+                "type": "string",
+                "description": "Report template style",
+                "nullable": True
+            },
+            "include_charts": {
+                "type": "boolean",
+                "description": "Whether to include interactive charts",
+                "nullable": True
+            },
+            "include_citations": {
+                "type": "boolean",
+                "description": "Whether to include citations and references",
+                "nullable": True
             }
-        )
+        }
+        self.output_type = "object"
     
-    async def run(self, report_data: Dict[str, Any], template_style: str = "professional", include_charts: bool = True, include_citations: bool = True) -> Dict[str, Any]:
-        """Generate HTML report"""
+    def forward(self, report_data: Dict[str, Any], template_style: str = "professional", include_charts: bool = True, include_citations: bool = True) -> Dict[str, Any]:
+        """Generate HTML report (synchronous)"""
+        try:
+            return self._run_sync(report_data, template_style, include_charts, include_citations)
+        except Exception as e:
+            logger.error(f"HTML report generation failed: {e}")
+            return {"error": str(e)}
+    
+    def _run_sync(self, report_data: Dict[str, Any], template_style: str, include_charts: bool, include_citations: bool) -> Dict[str, Any]:
+        """Synchronous HTML report generation"""
         try:
             # Generate HTML content
-            html_content = await self._generate_html_content(report_data, template_style, include_charts, include_citations)
+            html_content = self._generate_html_content(report_data, template_style, include_charts, include_citations)
             
             return {
                 "format": "html",
@@ -65,7 +72,7 @@ class HTMLReportTool(Tool):
             logger.error(f"HTML report generation failed: {e}")
             return {"error": str(e)}
     
-    async def _generate_html_content(self, report_data: Dict[str, Any], template_style: str, include_charts: bool, include_citations: bool) -> str:
+    def _generate_html_content(self, report_data: Dict[str, Any], template_style: str, include_charts: bool, include_citations: bool) -> str:
         """Generate HTML content for the report"""
         try:
             title = report_data.get("title", "Financial Research Report")
@@ -417,29 +424,33 @@ class MarkdownReportTool(Tool):
     """Tool for generating Markdown reports"""
     
     def __init__(self):
-        super().__init__(
-            name="generate_markdown_report",
-            description="Generate comprehensive Markdown financial reports",
-            parameters={
-                "report_data": {
-                    "type": "object",
-                    "description": "Report data and content"
-                },
-                "include_toc": {
-                    "type": "boolean",
-                    "description": "Whether to include table of contents",
-                    "default": True
-                }
+        super().__init__()
+        self.name = "generate_markdown_report"
+        self.description = "Generate comprehensive Markdown financial reports"
+        self.inputs = {
+            "report_data": {
+                "type": "object",
+                "description": "Report data and content"
+            },
+            "include_toc": {
+                "type": "boolean",
+                "description": "Whether to include table of contents",
+                "nullable": True
             }
-        )
+        }
+        self.output_type = "object"
     
-    async def run(self, report_data: Dict[str, Any], include_toc: bool = True) -> Dict[str, Any]:
+    def forward(self, report_data: Dict[str, Any], include_toc: bool = True) -> Dict[str, Any]:
         """Generate Markdown report"""
         try:
             title = report_data.get("title", "Financial Research Report")
             executive_summary = report_data.get("executive_summary", "")
             sections = report_data.get("sections", [])
             citations = report_data.get("citations", [])
+            
+            # Generate markdown content
+            markdown_content = f"# {title}\n\n"
+            markdown_content += f"*Generated on {datetime.now().strftime('%B %d, %Y')}*\n\n"
             
             # Generate markdown content
             markdown_content = f"# {title}\n\n"
@@ -497,25 +508,41 @@ class QualityAssessmentTool(Tool):
     """Tool for assessing report quality"""
     
     def __init__(self):
-        super().__init__(
-            name="assess_report_quality",
-            description="Assess the quality and completeness of reports",
-            parameters={
-                "report_data": {
-                    "type": "object",
-                    "description": "Report data to assess"
-                },
-                "quality_criteria": {
-                    "type": "array",
-                    "description": "Quality criteria to assess",
-                    "items": {"type": "string"},
-                    "default": ["completeness", "accuracy", "clarity", "structure", "citations"]
-                }
+        super().__init__()
+        self.name = "assess_report_quality"
+        self.description = "Assess the quality and completeness of reports"
+        self.inputs = {
+            "report_data": {
+                "type": "object",
+                "description": "Report data to assess"
+            },
+            "quality_criteria": {
+                "type": "array",
+                "description": "Quality criteria to assess",
+                "nullable": True
             }
-        )
+        }
+        self.output_type = "object"
     
-    async def run(self, report_data: Dict[str, Any], quality_criteria: List[str] = None) -> Dict[str, Any]:
+    def forward(self, report_data: Dict[str, Any], quality_criteria: List[str] = None) -> Dict[str, Any]:
         """Assess report quality"""
+        try:
+            if quality_criteria is None:
+                quality_criteria = ["completeness", "accuracy", "clarity", "structure", "citations"]
+            
+            # Use asyncio to run async operations
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(self._run_async(report_data, quality_criteria))
+            finally:
+                loop.close()
+        except Exception as e:
+            logger.error(f"Quality assessment failed: {e}")
+            return {"error": str(e)}
+    
+    async def _run_async(self, report_data: Dict[str, Any], quality_criteria: List[str]) -> Dict[str, Any]:
+        """Async helper for quality assessment"""
         try:
             if quality_criteria is None:
                 quality_criteria = ["completeness", "accuracy", "clarity", "structure", "citations"]
@@ -725,25 +752,41 @@ class DataVisualizationTool(Tool):
     """Tool for creating data visualizations"""
     
     def __init__(self):
-        super().__init__(
-            name="create_visualizations",
-            description="Create charts and data visualizations",
-            parameters={
-                "data": {
-                    "type": "object",
-                    "description": "Data to visualize"
-                },
-                "chart_types": {
-                    "type": "array",
-                    "description": "Types of charts to create",
-                    "items": {"type": "string", "enum": ["line", "bar", "pie", "scatter", "radar"]},
-                    "default": ["line", "bar"]
-                }
+        super().__init__()
+        self.name = "create_visualizations"
+        self.description = "Create charts and data visualizations"
+        self.inputs = {
+            "data": {
+                "type": "object",
+                "description": "Data to visualize"
+            },
+            "chart_types": {
+                "type": "array",
+                "description": "Types of charts to create",
+                "nullable": True
             }
-        )
+        }
+        self.output_type = "object"
     
-    async def run(self, data: Dict[str, Any], chart_types: List[str] = None) -> Dict[str, Any]:
+    def forward(self, data: Dict[str, Any], chart_types: List[str] = None) -> Dict[str, Any]:
         """Create data visualizations"""
+        try:
+            if chart_types is None:
+                chart_types = ["line", "bar"]
+            
+            # Use asyncio to run async operations
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(self._run_async(data, chart_types))
+            finally:
+                loop.close()
+        except Exception as e:
+            logger.error(f"Data visualization failed: {e}")
+            return {"error": str(e)}
+    
+    async def _run_async(self, data: Dict[str, Any], chart_types: List[str]) -> Dict[str, Any]:
+        """Async helper for data visualization"""
         try:
             if chart_types is None:
                 chart_types = ["line", "bar"]
@@ -817,11 +860,11 @@ class DataVisualizationTool(Tool):
 class FinalAnswerAgent(BaseAgent):
     """Agent for generating final comprehensive reports using SmolAgents"""
     
-    def __init__(self, model: OpenAIModel, memory: ConversationMemory = None):
+    def __init__(self, model: OpenAIModel, memory: AgentMemory = None):
         super().__init__(
             name="FinalAnswerAgent",
             model=model,
-            memory=memory or ConversationMemory()
+            memory=memory or AgentMemory(system_prompt="You are a final answer agent that generates comprehensive HTML reports.")
         )
         
         # Add report generation tools

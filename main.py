@@ -18,7 +18,8 @@ from src.search import SearchManager
 from src.utils import ModelAdapter, MCPManager
 from src.report import HTMLReportGenerator
 from config import config, get_model_config
-from smolagents import OpenAIModel, ConversationMemory
+from smolagents import OpenAIModel
+from smolagents.memory import AgentMemory
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -62,12 +63,12 @@ class DeepReportApp:
             model = OpenAIModel(
                 model_id=self.model_config.get("model", "gpt-4o"),
                 api_key=self.model_config.get("api_key", os.getenv("OPENAI_API_KEY")),
-                base_url=self.model_config.get("base_url", "https://api.openai.com/v1")
+                api_base=self.model_config.get("base_url", "https://api.chatanywhere.tech/v1")
             )
             
             # Initialize memory
-            memory = ConversationMemory()
-            
+            memory = AgentMemory(system_prompt="You are DeepReport, an AI-powered financial research assistant.")
+
             # Initialize planning agent
             self.agents["planning"] = PlanningAgent(model, memory)
             
@@ -96,28 +97,27 @@ class DeepReportApp:
             logger.info(f"Starting report generation for topic: {research_topic}")
             
             # Step 1: Create research plan
-            plan_result = await self.agents["planning"].run(
-                f"Create a comprehensive research plan for topic: {research_topic} with requirements: {requirements_list}"
+            plan_dict = await self.agents["planning"].create_research_plan(
+                research_topic=research_topic,
+                requirements=requirements_list,
+                output_format=output_format
             )
-            
-            if not plan_result:
-                return {"success": False, "error": "Failed to create research plan"}
-            
+
             # Step 2: Execute research tasks
-            task_results = await self._execute_research_plan(plan_result)
-            
+            task_results = await self._execute_research_plan(plan_dict)
+
             # Step 3: Generate final report
             report_data = {
                 "title": f"Financial Research Report: {research_topic}",
                 "subtitle": "Comprehensive Analysis and Insights",
                 "research_topic": research_topic,
                 "requirements": requirements_list,
-                "plan": plan_result,
+                "plan": plan_dict,
                 "task_results": task_results,
                 "generated_at": datetime.now().isoformat(),
                 "model": model,
                 "confidence_score": 85,
-                "data_points": sum(len(result.get("data", [])) for result in task_results.values()),
+                "data_points": sum(len(r.get("data", [])) for r in task_results.values() if isinstance(r, dict)),
                 "charts_data": self._extract_chart_data(task_results),
                 "citations": self._extract_citations(task_results),
                 "data_sources": self._extract_data_sources(task_results),
@@ -125,7 +125,7 @@ class DeepReportApp:
                 "key_metrics": self._extract_key_metrics(task_results),
                 "risk_assessment": self._extract_risk_assessment(task_results),
                 "recommendations": self._extract_recommendations(task_results),
-                "executive_summary": self._generate_executive_summary(plan_result, task_results)
+                "executive_summary": self._generate_executive_summary(plan_dict, task_results)
             }
             
             # Step 4: Generate HTML report
@@ -172,9 +172,9 @@ class DeepReportApp:
             task_type = task["task_type"]
             
             try:
-                if task_type == "deep_research":
+                if task_type == "deep_research" or task_type == "deep_researcher":
                     result = await self._execute_deep_research_task(task)
-                elif task_type == "browser_use":
+                elif task_type == "browser_use" or task_type == "browser":
                     result = await self._execute_browser_task(task)
                 elif task_type == "deep_analyze":
                     result = await self._execute_analysis_task(task)
@@ -184,7 +184,7 @@ class DeepReportApp:
                     logger.warning(f"Unknown task type: {task_type}")
                     continue
                 
-                task_results[task_id] = result
+                task_results[task_id] = result if isinstance(result, dict) else {"success": True, "data": str(result), "task_type": task_type}
                 
             except Exception as e:
                 logger.error(f"Failed to execute task {task_id}: {e}")
@@ -193,17 +193,35 @@ class DeepReportApp:
         return task_results
     
     async def _execute_browser_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute browser task"""
+        """Execute browser task - use search to find real URLs then extract content"""
         try:
-            result = await self.agents["browser"].run(
-                f"Perform web interaction for: {task['description']}"
-            )
-            
+            from src.agents.deep_researcher_agent import SourceDiscoveryTool, ContentExtractionTool
+
+            # Use search to find real sources instead of letting agent hallucinate URLs
+            source_tool = SourceDiscoveryTool()
+            sources_result = source_tool.forward(task['description'], max_results=5)
+            sources = sources_result.get('sources', []) if isinstance(sources_result, dict) else []
+
+            extracted_content = []
+            if sources:
+                content_tool = ContentExtractionTool()
+                urls = [s['url'] for s in sources[:3]]
+                content_result = content_tool.forward(urls, max_content_length=2000)
+                if isinstance(content_result, dict):
+                    extracted_content = content_result.get('extracted_content', [])
+
             return {
                 "success": True,
-                "data": result,
+                "data": {
+                    "agent_response": f"Found {len(sources)} sources, extracted {len(extracted_content)} contents",
+                    "results": sources,
+                    "structured_data": {
+                        "sources": sources,
+                        "extracted_content": extracted_content
+                    }
+                },
                 "task_type": "browser",
-                "execution_time": 0  # SmolAgents handles timing internally
+                "execution_time": 0
             }
         except Exception as e:
             return {
@@ -213,19 +231,43 @@ class DeepReportApp:
             }
     
     async def _execute_deep_research_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute deep research task"""
+        """Execute deep research task - directly call tools instead of using agent"""
         try:
-            result = await self.agents["deep_researcher"].run(
-                f"Research and filter high-quality data sources for: {task['description']}"
-            )
-            
+            from src.agents.deep_researcher_agent import SourceDiscoveryTool, ContentExtractionTool
+
+            # Directly call the tools to get structured data
+            source_tool = SourceDiscoveryTool()
+            sources_result = source_tool.forward(task['description'], max_results=10)
+
+            extracted_sources = sources_result.get('sources', []) if isinstance(sources_result, dict) else []
+
+            # Extract content from top sources
+            extracted_content = []
+            if extracted_sources:
+                content_tool = ContentExtractionTool()
+                urls = [s['url'] for s in extracted_sources[:5]]  # Top 5 sources
+                content_result = content_tool.forward(urls, max_content_length=2000)
+
+                if isinstance(content_result, dict):
+                    extracted_content = content_result.get('extracted_content', [])
+
             return {
                 "success": True,
-                "data": result,
+                "data": {
+                    "agent_response": f"Found {len(extracted_sources)} sources and extracted {len(extracted_content)} contents",
+                    "results": extracted_sources,
+                    "structured_data": {
+                        "sources": extracted_sources,
+                        "extracted_content": extracted_content,
+                        "total_sources": len(extracted_sources),
+                        "total_content_length": sum(c.get('content_length', 0) for c in extracted_content)
+                    }
+                },
                 "task_type": "deep_research",
-                "execution_time": 0  # SmolAgents handles timing internally
+                "execution_time": 0
             }
         except Exception as e:
+            logger.error(f"Deep research task failed: {e}")
             return {
                 "success": False,
                 "error": str(e),
@@ -235,13 +277,24 @@ class DeepReportApp:
     async def _execute_analysis_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
         """Execute analysis task"""
         try:
-            result = await self.agents["deep_analyze"].run(
-                f"Perform deep financial analysis for: {task['description']}"
+            result = self.agents["deep_analyze"].run(
+                f"Perform deep financial analysis for: {task['description']}",
+                max_steps=3
             )
-            
+
+            # Convert AgentText to string if needed
+            if hasattr(result, '__str__') and not isinstance(result, str):
+                result_str = str(result)
+            else:
+                result_str = result
+
             return {
                 "success": True,
-                "data": result,
+                "data": {
+                    "agent_response": result_str,
+                    "results": [],
+                    "structured_data": {}
+                },
                 "task_type": "analysis",
                 "execution_time": 0  # SmolAgents handles timing internally
             }
@@ -255,13 +308,24 @@ class DeepReportApp:
     async def _execute_final_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
         """Execute final task"""
         try:
-            result = await self.agents["final_answer"].run(
-                f"Generate final report for: {task['description']}"
+            result = self.agents["final_answer"].run(
+                f"Generate final report for: {task['description']}",
+                max_steps=3
             )
-            
+
+            # Convert AgentText to string if needed
+            if hasattr(result, '__str__') and not isinstance(result, str):
+                result_str = str(result)
+            else:
+                result_str = result
+
             return {
                 "success": True,
-                "data": result,
+                "data": {
+                    "agent_response": result_str,
+                    "report_content": result_str,
+                    "format": "html"
+                },
                 "task_type": "final",
                 "execution_time": 0  # SmolAgents handles timing internally
             }
@@ -277,22 +341,38 @@ class DeepReportApp:
         chart_data = []
         
         for task_id, result in task_results.items():
+            # Skip if result is not a dict
+            if not isinstance(result, dict):
+                continue
+
             if result.get("success") and result.get("data"):
                 data = result["data"]
                 
                 # Look for chart-able data
                 if isinstance(data, dict):
-                    if "results" in data:  # Search results
+                    # Handle search results (from deep_research task)
+                    if "results" in data and data["results"]:
+                        # Count sources by domain
+                        source_counts = {}
+                        for r in data["results"]:
+                            # Use 'domain' field from SourceDiscoveryTool, fallback to 'source'
+                            source = r.get("domain") or r.get("source", "Unknown")
+                            source_counts[source] = source_counts.get(source, 0) + 1
+
                         chart_data.append({
                             "id": f"chart_{task_id}",
                             "type": "bar",
                             "title": "Search Results by Engine",
-                            "labels": [r.get("source", "Unknown") for r in data["results"]],
-                            "values": [1 for _ in data["results"]],
-                            "description": "Distribution of search results by search engine"
+                            "labels": list(source_counts.keys()),
+                            "datasets": [{
+                                "label": "Number of Results",
+                                "data": list(source_counts.values())
+                            }],
+                            "description": f"Distribution of {len(data['results'])} search results across {len(source_counts)} domains"
                         })
-                    
-                    if "structured_data" in data:  # Browser data
+
+                    # Handle structured data (from browser task)
+                    if "structured_data" in data:
                         structured = data["structured_data"]
                         if structured.get("headings"):
                             chart_data.append({
@@ -311,6 +391,10 @@ class DeepReportApp:
         citations = []
         
         for task_id, result in task_results.items():
+            # Skip if result is not a dict
+            if not isinstance(result, dict):
+                continue
+
             if result.get("success") and result.get("data"):
                 data = result["data"]
                 
@@ -331,6 +415,10 @@ class DeepReportApp:
         sources = []
         
         for task_id, result in task_results.items():
+            # Skip if result is not a dict
+            if not isinstance(result, dict):
+                continue
+
             if result.get("success") and result.get("data"):
                 data = result["data"]
                 
@@ -371,12 +459,52 @@ class DeepReportApp:
         
         # Search results section
         search_results = []
+        extracted_contents = []
         for task_id, result in task_results.items():
             if result.get("success") and result.get("task_type") in ["deep_research", "browser"]:
                 data = result["data"]
-                if isinstance(data, dict) and "results" in data:
-                    search_results.extend(data["results"])
-        
+                if isinstance(data, dict):
+                    if "results" in data:
+                        search_results.extend(data["results"])
+                    if "structured_data" in data and "extracted_content" in data["structured_data"]:
+                        extracted_contents.extend(data["structured_data"]["extracted_content"])
+
+        # Add extracted content section first (most important)
+        if extracted_contents:
+            content_html = "<div class='row'>"
+            for i, content_item in enumerate(extracted_contents[:5]):  # Top 5 contents
+                url = content_item.get('url', '#')
+                text = content_item.get('content', '')
+                length = content_item.get('content_length', len(text))
+
+                # Truncate long content for display
+                preview = text[:500] + '...' if len(text) > 500 else text
+                preview = preview.replace('\n', '<br>')
+
+                content_html += f"""
+                <div class='col-md-12 mb-4'>
+                    <div class='card'>
+                        <div class='card-header bg-primary text-white'>
+                            <h6 class='mb-0'><i class='fas fa-file-alt'></i> Source Content {i + 1}</h6>
+                        </div>
+                        <div class='card-body'>
+                            <p class='text-muted small'>URL: <a href='{url}' target='_blank'>{url[:80]}...</a></p>
+                            <p class='text-muted small'>Length: {length} characters</p>
+                            <div class='alert alert-light' style='max-height: 300px; overflow-y: auto;'>
+                                {preview}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+                """
+            content_html += "</div>"
+
+            sections.append({
+                "id": "extracted_content",
+                "title": "Extracted Research Content",
+                "content": content_html
+            })
+
         if search_results:
             search_content = "<div class='row'>"
             for i, result in enumerate(search_results[:10]):  # Limit to top 10
@@ -490,8 +618,9 @@ class DeepReportApp:
         """Generate executive summary"""
         total_tasks = len(task_results)
         successful_tasks = sum(1 for r in task_results.values() if r.get("success"))
-        total_results = sum(len(r.get("data", {}).get("results", [])) for r in task_results.values() if r.get("success"))
-        
+        total_results = sum(
+            len(r.get("data", {}).get("results", [])) for r in task_results.values() if r.get("success"))
+
         return f"""
         This financial research report was generated using AI-powered analysis of {total_results} data points 
         across {successful_tasks} successful research tasks. The research focused on {plan.get('research_topic', 'the specified topic')} 
@@ -500,6 +629,21 @@ class DeepReportApp:
         Key findings include comprehensive market analysis, trend identification, and risk assessment. 
         The report provides actionable insights based on current market conditions and reliable data sources.
         """
+
+    def _generate_fallback_plan(self, research_topic: str, requirements_list: List[str]) -> Dict[str, Any]:
+        """Generate a fallback research plan when JSON parsing fails"""
+        return {
+            "research_topic": research_topic,
+            "requirements": requirements_list,
+            "tasks": [
+                {
+                    "task_id": "task_001",
+                    "task_type": "deep_research",
+                    "description": f"Research and analyze: {research_topic}",
+                    "priority": "high"
+                }
+            ]
+        }
 
 
 # Create global app instance
@@ -661,7 +805,6 @@ if __name__ == "__main__":
     demo.launch(
         server_name="0.0.0.0",
         server_port=7860,
-        share=False,
-        debug=True,
-        show_api=False
+        share=True,
+        debug=True
     )

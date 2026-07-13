@@ -12,71 +12,234 @@ from datetime import datetime
 from urllib.parse import urlparse
 import aiohttp
 import fitz  # PyMuPDF for PDF processing
-from browser_use import BrowserUse
+from playwright.async_api import async_playwright
 from smolagents import Tool
-from smolagents.memory import ConversationMemory
+from smolagents.memory import AgentMemory
 from smolagents.models import OpenAIModel
 
 from .base_agent import BaseAgent, Task, TaskResult
 
 logger = logging.getLogger(__name__)
 
+# Compatibility wrapper for browser_use library (which removed BrowserUse class in newer versions)
+class BrowserUse:
+    """Compatibility wrapper using Playwright for web automation"""
+    
+    def __init__(self):
+        self.playwright = None
+        self.browser = None
+        self.context = None
+        self.page = None
+    
+    async def __aenter__(self):
+        await self.start()
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        await self.close()
+    
+    async def start(self):
+        """Initialize Playwright browser"""
+        self.playwright = await async_playwright().start()
+        self.browser = await self.playwright.chromium.launch(headless=True)
+        self.context = await self.browser.new_context()
+        self.page = await self.context.new_page()
+    
+    async def close(self):
+        """Close browser resources"""
+        if self.browser:
+            await self.browser.close()
+        if self.playwright:
+            await self.playwright.stop()
+    
+    async def goto(self, url: str, timeout: int = 30000):
+        """Navigate to URL"""
+        await self.page.goto(url, timeout=timeout, wait_until='domcontentloaded')
+    
+    async def get_title(self) -> str:
+        """Get page title"""
+        return await self.page.title()
+    
+    async def get_text_content(self) -> str:
+        """Get all text content from the page"""
+        return await self.page.inner_text('body')
+    
+    async def click_element(self, selector: str):
+        """Click an element by CSS selector"""
+        await self.page.click(selector, timeout=10000)
+    
+    async def fill_input(self, selector: str, value: str):
+        """Fill an input field"""
+        await self.page.fill(selector, value, timeout=10000)
+    
+    async def scroll_to_element(self, selector: str):
+        """Scroll to an element"""
+        await self.page.wait_for_selector(selector, timeout=10000)
+        await self.page.evaluate(f"""
+            document.querySelector('{selector}').scrollIntoView({{behavior: 'smooth'}})
+        """)
+    
+    async def extract_element_text(self, selector: str) -> str:
+        """Extract text from an element"""
+        try:
+            element = await self.page.query_selector(selector)
+            if element:
+                return await element.inner_text()
+            return ""
+        except Exception:
+            return ""
+    
+    async def get_tables(self) -> List[List[str]]:
+        """Extract all tables from the page"""
+        try:
+            tables = await self.page.evaluate("""
+                () => {
+                    const tables = Array.from(document.querySelectorAll('table'));
+                    return tables.map(table => {
+                        const rows = Array.from(table.querySelectorAll('tr'));
+                        return rows.map(row => {
+                            const cells = Array.from(row.querySelectorAll('td, th'));
+                            return cells.map(cell => cell.textContent.trim()).filter(Boolean);
+                        }).filter(row => row.length > 0);
+                    });
+                }
+            """)
+            return tables
+        except Exception:
+            return []
+    
+    async def get_forms(self) -> List[Dict[str, Any]]:
+        """Extract all forms from the page"""
+        try:
+            forms = await self.page.evaluate("""
+                () => {
+                    const forms = Array.from(document.querySelectorAll('form'));
+                    return forms.map(form => {
+                        const fields = Array.from(form.querySelectorAll('input, select, textarea'));
+                        return {
+                            id: form.id || '',
+                            action: form.action || '',
+                            method: form.method || '',
+                            fields: fields.map(field => ({
+                                name: field.name || '',
+                                type: field.type || field.tagName.toLowerCase(),
+                                placeholder: field.placeholder || ''
+                            }))
+                        };
+                    });
+                }
+            """)
+            return forms
+        except Exception:
+            return []
+    
+    async def get_lists(self) -> List[List[str]]:
+        """Extract all lists from the page"""
+        try:
+            lists = await self.page.evaluate("""
+                () => {
+                    const lists = Array.from(document.querySelectorAll('ul, ol'));
+                    return lists.map(list => {
+                        const items = Array.from(list.querySelectorAll('li'));
+                        return items.map(item => item.textContent.trim());
+                    });
+                }
+            """)
+            return lists
+        except Exception:
+            return []
+    
+    async def get_links(self) -> List[Dict[str, str]]:
+        """Extract all links from the page"""
+        try:
+            links = await self.page.evaluate("""
+                () => {
+                    const links = Array.from(document.querySelectorAll('a[href]'));
+                    return links.map(link => ({
+                        text: link.textContent.trim(),
+                        href: link.href,
+                        title: link.title || ''
+                    }));
+                }
+            """)
+            return links
+        except Exception:
+            return []
+    
+    async def get_images(self) -> List[Dict[str, str]]:
+        """Extract all images from the page"""
+        try:
+            images = await self.page.evaluate("""
+                () => {
+                    const images = Array.from(document.querySelectorAll('img'));
+                    return images.map(img => ({
+                        src: img.src,
+                        alt: img.alt || '',
+                        title: img.title || ''
+                    }));
+                }
+            """)
+            return images
+        except Exception:
+            return []
+    
+    async def click_button(self, selector: str):
+        """Click a button by CSS selector"""
+        await self.page.click(selector, timeout=10000)
+
 class WebNavigationTool(Tool):
     """Tool for web navigation and interaction"""
     
     def __init__(self, browser: BrowserUse):
-        super().__init__(
-            name="navigate_web",
-            description="Navigate and interact with web pages",
-            parameters={
-                "url": {
-                    "type": "string",
-                    "description": "URL to navigate to"
-                },
-                "actions": {
-                    "type": "array",
-                    "description": "List of actions to perform on the page",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "type": {"type": "string", "enum": ["click", "fill", "scroll", "extract"]},
-                            "target": {"type": "string"},
-                            "value": {"type": "string"}
-                        }
-                    }
-                }
+        super().__init__()
+        self.name = "navigate_web"
+        self.description = "Navigate and interact with web pages"
+        self.inputs = {
+            "url": {
+                "type": "string",
+                "description": "URL to navigate to"
+            },
+            "actions": {
+                "type": "array",
+                "description": "List of actions to perform on the page",
+                "nullable": True
             }
-        )
+        }
+        self.output_type = "object"
         self.browser = browser
     
-    async def run(self, url: str, actions: List[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """Navigate to URL and perform actions"""
+    def forward(self, url: str, actions: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Navigate to URL and perform actions (synchronous)"""
         try:
-            # Navigate to URL
-            await self.browser.goto(url)
-            
-            # Extract basic page information
-            title = await self.browser.get_title()
-            content = await self.browser.get_text_content()
-            
-            # Perform actions
-            action_results = []
-            if actions:
-                for action in actions:
-                    result = await self._perform_action(action)
-                    action_results.append(result)
-            
-            return {
-                "url": url,
-                "title": title,
-                "content": content,
-                "action_results": action_results,
-                "timestamp": datetime.now().isoformat()
-            }
-            
+            # Note: This tool requires browser initialization
+            return {"error": "WebNavigationTool requires async context - use BrowserAgent directly"}
         except Exception as e:
             logger.error(f"Web navigation failed: {e}")
             return {"error": str(e)}
+    
+    async def _navigate_and_perform(self, url: str, actions: List[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Async helper for navigation"""
+        # Navigate to URL
+        await self.browser.goto(url)
+        
+        # Extract basic page information
+        title = await self.browser.get_title()
+        content = await self.browser.get_text_content()
+        
+        # Perform actions
+        action_results = []
+        if actions:
+            for action in actions:
+                result = await self._perform_action(action)
+                action_results.append(result)
+        
+        return {
+            "url": url,
+            "title": title,
+            "content": content,
+            "action_results": action_results,
+            "timestamp": datetime.now().isoformat()
+        }
     
     async def _perform_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
         """Perform a single action on the page"""
@@ -107,241 +270,265 @@ class PDFAnalysisTool(Tool):
     """Tool for analyzing PDF documents"""
     
     def __init__(self):
-        super().__init__(
-            name="analyze_pdf",
-            description="Analyze PDF documents for financial data and content",
-            parameters={
-                "pdf_path": {
-                    "type": "string",
-                    "description": "Path or URL to PDF document"
-                },
-                "extract_tables": {
-                    "type": "boolean",
-                    "description": "Whether to extract tables from PDF",
-                    "default": True
-                },
-                "extract_charts": {
-                    "type": "boolean",
-                    "description": "Whether to extract chart information",
-                    "default": True
-                }
+        super().__init__()
+        self.name = "analyze_pdf"
+        self.description = "Analyze PDF documents for financial data and content"
+        self.inputs = {
+            "pdf_path": {
+                "type": "string",
+                "description": "Path or URL to PDF document"
+            },
+            "extract_tables": {
+                "type": "boolean",
+                "description": "Whether to extract tables from PDF",
+                "nullable": True
+            },
+            "extract_charts": {
+                "type": "boolean",
+                "description": "Whether to extract chart information",
+                "nullable": True
             }
-        )
+        }
+        self.output_type = "object"
     
-    async def run(self, pdf_path: str, extract_tables: bool = True, extract_charts: bool = True) -> Dict[str, Any]:
-        """Analyze PDF document content"""
+    def forward(self, pdf_path: str, extract_tables: bool = True, extract_charts: bool = True) -> Dict[str, Any]:
+        """Analyze PDF document content (synchronous)"""
         try:
-            # Check if it's a URL or local path
-            if pdf_path.startswith("http"):
-                # Download PDF from URL
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(pdf_path) as response:
-                        if response.status == 200:
-                            pdf_data = await response.read()
-                            # Save to temporary file
-                            with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
-                                temp_file.write(pdf_data)
-                                pdf_path = temp_file.name
-                        else:
-                            return {"error": f"Failed to download PDF: {response.status}"}
-            
-            # Analyze PDF using PyMuPDF
-            doc = fitz.open(pdf_path)
-            
-            analysis = {
-                "metadata": doc.metadata,
-                "page_count": len(doc),
-                "word_count": 0,
-                "sections": [],
-                "tables": [],
-                "charts": [],
-                "financial_data": [],
-                "full_text": ""
-            }
-            
-            # Extract text and analyze structure
-            full_text = ""
-            for page_num, page in enumerate(doc):
-                text = page.get_text()
-                full_text += text
-                
-                # Basic section detection
-                if text.strip():
-                    analysis["sections"].append({
-                        "page": page_num + 1,
-                        "content": text[:500] + "..." if len(text) > 500 else text,
-                        "word_count": len(text.split())
-                    })
-                
-                # Extract tables
-                if extract_tables:
-                    tables = page.find_tables()
-                    for table in tables:
-                        analysis["tables"].append({
-                            "page": page_num + 1,
-                            "rows": len(table.rows()),
-                            "cols": len(table.cols()),
-                            "data": table.extract()
-                        })
-                
-                # Look for financial data patterns
-                financial_indicators = ["$", "%", "revenue", "profit", "loss", "EBITDA", "EPS", "P/E"]
-                found_indicators = [indicator for indicator in financial_indicators if indicator.lower() in text.lower()]
-                if found_indicators:
-                    analysis["financial_data"].append({
-                        "page": page_num + 1,
-                        "indicators": found_indicators,
-                        "context": text[:200]
-                    })
-            
-            analysis["full_text"] = full_text
-            analysis["word_count"] = len(full_text.split())
-            
-            # Clean up temporary file if created
-            if pdf_path.startswith("/tmp/"):
-                os.unlink(pdf_path)
-            
-            doc.close()
-            
-            return analysis
-            
+            return self._analyze_pdf_sync(pdf_path, extract_tables, extract_charts)
         except Exception as e:
             logger.error(f"PDF analysis failed: {e}")
             return {"error": str(e)}
+    
+    def _analyze_pdf_sync(self, pdf_path: str, extract_tables: bool = True, extract_charts: bool = True) -> Dict[str, Any]:
+        """Synchronous PDF analysis"""
+        import requests
+        
+        # Check if it's a URL or local path
+        if pdf_path.startswith("http"):
+            # Download PDF from URL
+            response = requests.get(pdf_path)
+            if response.status_code == 200:
+                # Save to temporary file
+                with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
+                    temp_file.write(response.content)
+                    pdf_path = temp_file.name
+            else:
+                return {"error": f"Failed to download PDF: {response.status_code}"}
+        
+        # Analyze PDF using PyMuPDF
+        doc = fitz.open(pdf_path)
+        
+        analysis = {
+            "metadata": doc.metadata,
+            "page_count": len(doc),
+            "word_count": 0,
+            "sections": [],
+            "tables": [],
+            "charts": [],
+            "financial_data": [],
+            "full_text": ""
+        }
+        
+        # Extract text and analyze structure
+        full_text = ""
+        for page_num, page in enumerate(doc):
+            text = page.get_text()
+            full_text += text
+            
+            # Basic section detection
+            if text.strip():
+                analysis["sections"].append({
+                    "page": page_num + 1,
+                    "content": text[:500] + "..." if len(text) > 500 else text,
+                    "word_count": len(text.split())
+                })
+            
+            # Extract tables
+            if extract_tables:
+                tables = page.find_tables()
+                for table in tables:
+                    analysis["tables"].append({
+                        "page": page_num + 1,
+                        "rows": len(table.rows()),
+                        "cols": len(table.cols()),
+                        "data": table.extract()
+                    })
+            
+            # Look for financial data patterns
+            financial_indicators = ["$", "%", "revenue", "profit", "loss", "EBITDA", "EPS", "P/E"]
+            found_indicators = [indicator for indicator in financial_indicators if indicator.lower() in text.lower()]
+            if found_indicators:
+                analysis["financial_data"].append({
+                    "page": page_num + 1,
+                    "indicators": found_indicators,
+                    "context": text[:200]
+                })
+        
+        analysis["full_text"] = full_text
+        analysis["word_count"] = len(full_text.split())
+        
+        # Clean up temporary file if created
+        if pdf_path.startswith("/tmp/"):
+            os.unlink(pdf_path)
+        
+        doc.close()
+        
+        return analysis
 
 class StructuredDataExtractionTool(Tool):
     """Tool for extracting structured data from web pages"""
     
     def __init__(self, browser: BrowserUse):
-        super().__init__(
-            name="extract_structured_data",
-            description="Extract structured data (tables, forms, lists) from web pages",
-            parameters={
-                "url": {
-                    "type": "string",
-                    "description": "URL to extract data from"
-                },
-                "data_types": {
-                    "type": "array",
-                    "description": "Types of data to extract",
-                    "items": {"type": "string", "enum": ["tables", "forms", "lists", "links", "images"]},
-                    "default": ["tables", "forms", "lists"]
-                }
+        super().__init__()
+        self.name = "extract_structured_data"
+        self.description = "Extract structured data (tables, forms, lists) from web pages"
+        self.inputs = {
+            "url": {
+                "type": "string",
+                "description": "URL to extract data from"
+            },
+            "data_types": {
+                "type": "array",
+                "description": "Types of data to extract",
+                "nullable": True
             }
-        )
+        }
+        self.output_type = "object"
         self.browser = browser
     
-    async def run(self, url: str, data_types: List[str] = None) -> Dict[str, Any]:
-        """Extract structured data from web page"""
+    def forward(self, url: str, data_types: List[str] = None) -> Dict[str, Any]:
+        """Extract structured data from web page (synchronous)"""
         try:
-            if data_types is None:
-                data_types = ["tables", "forms", "lists"]
-            
-            await self.browser.goto(url)
-            
-            structured_data = {
-                "url": url,
-                "title": await self.browser.get_title(),
-                "extracted_data": {}
-            }
-            
-            # Extract different types of structured data
-            if "tables" in data_types:
-                tables = await self.browser.get_tables()
-                structured_data["extracted_data"]["tables"] = tables
-            
-            if "forms" in data_types:
-                forms = await self.browser.get_forms()
-                structured_data["extracted_data"]["forms"] = forms
-            
-            if "lists" in data_types:
-                lists = await self.browser.get_lists()
-                structured_data["extracted_data"]["lists"] = lists
-            
-            if "links" in data_types:
-                links = await self.browser.get_links()
-                structured_data["extracted_data"]["links"] = links
-            
-            if "images" in data_types:
-                images = await self.browser.get_images()
-                structured_data["extracted_data"]["images"] = images
-            
-            return structured_data
-            
+            # Note: This tool requires browser initialization
+            return {"error": "StructuredDataExtractionTool requires async context - use BrowserAgent directly"}
         except Exception as e:
             logger.error(f"Structured data extraction failed: {e}")
             return {"error": str(e)}
+    
+    async def _extract_data_async(self, url: str, data_types: List[str] = None) -> Dict[str, Any]:
+        """Async helper for structured data extraction"""
+        if data_types is None:
+            data_types = ["tables", "forms", "lists"]
+        
+        await self.browser.goto(url)
+        
+        structured_data = {
+            "url": url,
+            "title": await self.browser.get_title(),
+            "extracted_data": {}
+        }
+        
+        # Extract different types of structured data
+        if "tables" in data_types:
+            tables = await self.browser.get_tables()
+            structured_data["extracted_data"]["tables"] = tables
+        
+        if "forms" in data_types:
+            forms = await self.browser.get_forms()
+            structured_data["extracted_data"]["forms"] = forms
+        
+        if "lists" in data_types:
+            lists = await self.browser.get_lists()
+            structured_data["extracted_data"]["lists"] = lists
+        
+        if "links" in data_types:
+            links = await self.browser.get_links()
+            structured_data["extracted_data"]["links"] = links
+        
+        if "images" in data_types:
+            images = await self.browser.get_images()
+            structured_data["extracted_data"]["images"] = images
+        
+        return structured_data
 
 class FormInteractionTool(Tool):
     """Tool for interacting with web forms"""
     
     def __init__(self, browser: BrowserUse):
-        super().__init__(
-            name="interact_with_form",
-            description="Fill and submit web forms",
-            parameters={
-                "url": {
-                    "type": "string",
-                    "description": "URL containing the form"
-                },
-                "form_data": {
-                    "type": "object",
-                    "description": "Form field names and values to fill"
-                },
-                "submit_button": {
-                    "type": "string",
-                    "description": "Selector for the submit button"
-                }
+        super().__init__()
+        self.name = "interact_with_form"
+        self.description = "Fill and submit web forms"
+        self.inputs = {
+            "url": {
+                "type": "string",
+                "description": "URL containing the form"
+            },
+            "form_data": {
+                "type": "object",
+                "description": "Form field names and values to fill"
+            },
+            "submit_button": {
+                "type": "string",
+                "description": "Selector for the submit button",
+                "nullable": True
             }
-        )
+        }
+        self.output_type = "object"
         self.browser = browser
     
-    async def run(self, url: str, form_data: Dict[str, Any], submit_button: str = None) -> Dict[str, Any]:
-        """Interact with web forms"""
+    def forward(self, url: str, form_data: Dict[str, Any], submit_button: str = None) -> Dict[str, Any]:
+        """Interact with web forms (synchronous)"""
         try:
-            await self.browser.goto(url)
-            
-            # Fill form fields
-            for field_name, field_value in form_data.items():
-                await self.browser.fill_input(field_name, field_value)
-            
-            # Submit form if button specified
-            if submit_button:
-                await self.browser.click_button(submit_button)
-            
-            # Extract results after form submission
-            result_content = await self.browser.get_text_content()
-            
-            return {
-                "url": url,
-                "form_data": form_data,
-                "submitted": submit_button is not None,
-                "result_content": result_content,
-                "timestamp": datetime.now().isoformat()
-            }
-            
+            # Note: This tool requires browser initialization
+            return {"error": "FormInteractionTool requires async context - use BrowserAgent directly"}
         except Exception as e:
             logger.error(f"Form interaction failed: {e}")
             return {"error": str(e)}
+    
+    async def _interact_form_async(self, url: str, form_data: Dict[str, Any], submit_button: str = None) -> Dict[str, Any]:
+        """Async helper for form interaction"""
+        await self.browser.goto(url)
+        
+        # Fill form fields
+        for field_name, field_value in form_data.items():
+            await self.browser.fill_input(field_name, field_value)
+        
+        # Submit form if button specified
+        if submit_button:
+            await self.browser.click_button(submit_button)
+        
+        # Extract results after form submission
+        result_content = await self.browser.get_text_content()
+        
+        return {
+            "url": url,
+            "form_data": form_data,
+            "submitted": submit_button is not None,
+            "result_content": result_content,
+            "timestamp": datetime.now().isoformat()
+        }
 
 class BrowserAgent(BaseAgent):
     """Agent for fine-grained web interaction using browser-use library and SmolAgents"""
     
-    def __init__(self, model: OpenAIModel, memory: ConversationMemory = None):
+    def __init__(self, model: OpenAIModel, memory: AgentMemory = None):
+        # Initialize browser wrapper (not the actual browser yet)
+        self.browser = BrowserUse()
+        self.browser_initialized = False
+        
+        # Initialize tools dict before calling super().__init__
+        # This is needed because ToolCallingAgent.__init__ will access self.tools
+        self.tools = {}
+        
         super().__init__(
             name="BrowserAgent",
             model=model,
-            memory=memory or ConversationMemory()
+            memory=memory or AgentMemory(system_prompt="You are a browser agent that performs web interaction and PDF analysis.")
         )
         
-        self.browser = None
-        self.browser_initialized = False
+        # Add PDF tool which doesn't need browser
+        self.add_custom_tool(PDFAnalysisTool())
         
     async def start(self):
         """Start the browser agent"""
         await super().start()
-        await self._initialize_browser()
-        await self._setup_tools()
+        # Initialize browser and add remaining tools
+        if not self.browser_initialized:
+            await self.browser.start()
+            self.browser_initialized = True
+            self.add_custom_tool(WebNavigationTool(self.browser))
+            self.add_custom_tool(StructuredDataExtractionTool(self.browser))
+            self.add_custom_tool(FormInteractionTool(self.browser))
         
     async def _initialize_browser(self):
         """Initialize browser-use instance"""
@@ -353,14 +540,13 @@ class BrowserAgent(BaseAgent):
             logger.error(f"Failed to initialize browser-use: {e}")
             raise
     
-    async def _setup_tools(self):
-        """Setup browser tools"""
-        if self.browser_initialized:
-            self.add_custom_tool(WebNavigationTool(self.browser))
-            self.add_custom_tool(StructuredDataExtractionTool(self.browser))
-            self.add_custom_tool(FormInteractionTool(self.browser))
+    def _setup_tools(self, tools, add_base_tools):
+        """Setup browser tools - called by parent __init__ synchronously"""
+        # Initialize tools dict (required by parent class)
+        self.tools = {tool.name: tool for tool in tools} if tools else {}
         
-        self.add_custom_tool(PDFAnalysisTool())
+        # Don't add base tools automatically
+        # We'll add our custom tools later in start() method
     
     async def execute_task(self, task: Task) -> TaskResult:
         """Execute browser-related tasks using SmolAgents"""
