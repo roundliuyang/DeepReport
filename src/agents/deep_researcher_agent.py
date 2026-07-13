@@ -5,15 +5,18 @@ Deep Researcher Agent for filtering high-quality data sources using SmolAgents
 import asyncio
 import json
 import logging
+import requests
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from urllib.parse import urlparse
 from smolagents import Tool
-from smolagents.memory import ConversationMemory
+from smolagents.memory import AgentMemory
 from smolagents.models import OpenAIModel
-from langchain_community.tools import DuckDuckGoSearchRun
+import serpapi
 from langchain_community.document_loaders import WebBaseLoader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+import requests
+from bs4 import BeautifulSoup
 
 from .base_agent import BaseAgent, Task, TaskResult
 
@@ -23,33 +26,51 @@ class SourceDiscoveryTool(Tool):
     """Tool for discovering high-quality data sources"""
     
     def __init__(self):
-        super().__init__(
-            name="discover_sources",
-            description="Search for high-quality financial data sources and research materials",
-            parameters={
-                "query": {
-                    "type": "string",
-                    "description": "Search query for financial data sources"
-                },
-                "source_type": {
-                    "type": "string",
-                    "description": "Type of sources to find (news, reports, data, analysis)",
-                    "default": "all"
-                },
-                "max_results": {
-                    "type": "integer",
-                    "description": "Maximum number of results to return",
-                    "default": 10
-                }
+        super().__init__()
+        self.name = "discover_sources"
+        self.description = "Search for high-quality financial data sources and research materials"
+        self.inputs = {
+            "query": {
+                "type": "string",
+                "description": "Search query for financial data sources"
+            },
+            "source_type": {
+                "type": "string",
+                "description": "Type of sources to find (news, reports, data, analysis)",
+                "nullable": True
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Maximum number of results to return",
+                "nullable": True
             }
-        )
+        }
+        self.output_type = "object"
     
-    async def run(self, query: str, source_type: str = "all", max_results: int = 10) -> Dict[str, Any]:
-        """Discover high-quality sources for financial research"""
+    def forward(self, query: str, source_type: str = "all", max_results: int = 10) -> Dict[str, Any]:
+        """Discover high-quality sources for financial research (synchronous)"""
         try:
-            # Use DuckDuckGo for initial search
-            search_tool = DuckDuckGoSearchRun()
-            search_results = search_tool.run(query)
+            return self._run_sync(query, source_type, max_results)
+        except Exception as e:
+            logger.error(f"Source discovery failed: {e}")
+            return {"error": str(e)}
+    
+    def _run_sync(self, query: str, source_type: str = "all", max_results: int = 10) -> Dict[str, Any]:
+        """Discover high-quality sources for financial research using SerpAPI"""
+        try:
+            # Use SerpAPI for search
+            serper_api_key = "b353005664862657b0582ba09c2d987dfbdae60bea06d34b7eec9090127b90d6"
+            if not serper_api_key:
+                logger.warning("SERPAPI_API_KEY not set, returning empty results")
+                return {"sources": [], "total_found": 0, "query": query, "high_quality_count": 0}
+            
+            client = serpapi.Client(api_key=serper_api_key)
+            search_result = client.search({
+                "q": query,
+                "num": max_results,
+                "hl": "en",
+                "gl": "us"
+            })
             
             # Parse and filter results
             sources = []
@@ -59,30 +80,31 @@ class SourceDiscoveryTool(Tool):
                 "morningstar.com", "investopedia.com", "cnbc.com"
             ]
             
-            lines = search_results.split('\n')
-            for i, line in enumerate(lines):
-                if line.strip() and i < max_results:
-                    if 'http' in line:
-                        parts = line.split('http', 1)
-                        if len(parts) > 1:
-                            url = 'http' + parts[1].split()[0]
-                            title = parts[0].strip()
-                            domain = urlparse(url).netloc.lower()
-                            
-                            # Quality assessment
-                            quality_score = 0.5
-                            for quality_domain in high_quality_domains:
-                                if quality_domain in domain:
-                                    quality_score = 0.9
-                                    break
-                            
-                            sources.append({
-                                "url": url,
-                                "title": title,
-                                "domain": domain,
-                                "quality_score": quality_score,
-                                "source_type": source_type
-                            })
+            organic_results = search_result.get('organic_results', [])
+            
+            for result in organic_results:
+                url = result.get('link', '')
+                title = result.get('title', '')
+                snippet = result.get('snippet', '')
+                domain = urlparse(url).netloc.lower()
+                
+                # Quality assessment
+                quality_score = 0.5
+                for quality_domain in high_quality_domains:
+                    if quality_domain in domain:
+                        quality_score = 0.9
+                        break
+                
+                sources.append({
+                    "url": url,
+                    "title": title,
+                    "snippet": snippet,
+                    "domain": domain,
+                    "quality_score": quality_score,
+                    "source_type": source_type
+                })
+            
+            logger.info(f"SerpAPI found {len(sources)} sources for query: {query}")
             
             return {
                 "sources": sources,
@@ -93,62 +115,86 @@ class SourceDiscoveryTool(Tool):
             
         except Exception as e:
             logger.error(f"Source discovery failed: {e}")
-            return {"error": str(e)}
+            return {"error": str(e), "sources": [], "total_found": 0}
 
 class ContentExtractionTool(Tool):
     """Tool for extracting content from web sources"""
     
     def __init__(self):
-        super().__init__(
-            name="extract_content",
-            description="Extract and analyze content from web sources",
-            parameters={
-                "urls": {
-                    "type": "array",
-                    "description": "List of URLs to extract content from",
-                    "items": {"type": "string"}
-                },
-                "max_content_length": {
-                    "type": "integer",
-                    "description": "Maximum content length per source",
-                    "default": 2000
-                }
+        super().__init__()
+        self.name = "extract_content"
+        self.description = "Extract and analyze content from web sources"
+        self.inputs = {
+            "urls": {
+                "type": "array",
+                "description": "List of URLs to extract content from"
+            },
+            "max_content_length": {
+                "type": "integer",
+                "description": "Maximum content length per source",
+                "nullable": True
             }
-        )
+        }
+        self.output_type = "object"
     
-    async def run(self, urls: List[str], max_content_length: int = 2000) -> Dict[str, Any]:
-        """Extract content from multiple web sources"""
+    def forward(self, urls: List[str], max_content_length: int = 2000) -> Dict[str, Any]:
+        """Extract content from multiple web sources (synchronous)"""
         try:
+            return self._run_sync(urls, max_content_length)
+        except Exception as e:
+            logger.error(f"Content extraction failed: {e}")
+            return {"error": str(e)}
+    
+    def _run_sync(self, urls: List[str], max_content_length: int = 2000) -> Dict[str, Any]:
+        """Extract content from multiple web sources using requests and BeautifulSoup"""
+        try:
+            import time
             extracted_content = []
+            
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            }
             
             for url in urls:
                 try:
-                    # Use WebBaseLoader for content extraction
-                    loader = WebBaseLoader([url])
-                    documents = loader.load()
+                    # Use requests to fetch content
+                    response = requests.get(url, headers=headers, timeout=10)
+                    response.raise_for_status()
                     
-                    if documents:
-                        # Split content into manageable chunks
-                        text_splitter = RecursiveCharacterTextSplitter(
-                            chunk_size=1000,
-                            chunk_overlap=200
-                        )
-                        chunks = text_splitter.split_documents(documents)
-                        
-                        # Get main content
-                        main_content = chunks[0].page_content if chunks else ""
-                        if len(main_content) > max_content_length:
-                            main_content = main_content[:max_content_length]
-                        
-                        extracted_content.append({
-                            "url": url,
-                            "content": main_content,
-                            "chunks_count": len(chunks),
-                            "content_length": len(main_content)
-                        })
+                    # Parse with BeautifulSoup
+                    soup = BeautifulSoup(response.content, 'html.parser')
+                    
+                    # Remove script and style elements
+                    for script in soup(["script", "style", "nav", "footer", "header"]):
+                        script.decompose()
+                    
+                    # Get text content
+                    text = soup.get_text(separator='\n', strip=True)
+                    
+                    # Clean up whitespace
+                    lines = [line.strip() for line in text.split('\n') if line.strip()]
+                    clean_text = '\n'.join(lines)
+                    
+                    # Limit content length
+                    if len(clean_text) > max_content_length:
+                        clean_text = clean_text[:max_content_length]
+                    
+                    # Skip if content is too short (< 200 chars means extraction failed)
+                    if len(clean_text) < 200:
+                        logger.warning(f"Content too short for {url}: {len(clean_text)} chars")
+                        continue
+                    
+                    extracted_content.append({
+                        "url": url,
+                        "content": clean_text,
+                        "chunks_count": 1,
+                        "content_length": len(clean_text)
+                    })
+                    
+                    logger.info(f"Successfully extracted {len(clean_text)} chars from {url}")
                     
                     # Small delay to avoid overwhelming servers
-                    await asyncio.sleep(1)
+                    time.sleep(1)
                     
                 except Exception as e:
                     logger.warning(f"Failed to extract content from {url}: {e}")
@@ -169,22 +215,22 @@ class QualityAssessmentTool(Tool):
     """Tool for assessing content quality"""
     
     def __init__(self):
-        super().__init__(
-            name="assess_quality",
-            description="Assess the quality and relevance of extracted content",
-            parameters={
-                "content_data": {
-                    "type": "array",
-                    "description": "Array of content objects to assess"
-                },
-                "research_topic": {
-                    "type": "string",
-                    "description": "The research topic for relevance assessment"
-                }
+        super().__init__()
+        self.name = "assess_quality"
+        self.description = "Assess the quality and relevance of extracted content"
+        self.inputs = {
+            "content_data": {
+                "type": "array",
+                "description": "Array of content objects to assess"
+            },
+            "research_topic": {
+                "type": "string",
+                "description": "The research topic for relevance assessment"
             }
-        )
+        }
+        self.output_type = "object"
     
-    async def run(self, content_data: List[Dict[str, Any]], research_topic: str) -> Dict[str, Any]:
+    def forward(self, content_data: List[Dict[str, Any]], research_topic: str) -> Dict[str, Any]:
         """Assess quality and relevance of content"""
         try:
             quality_assessments = []
@@ -295,11 +341,11 @@ class QualityAssessmentTool(Tool):
 class DeepResearcherAgent(BaseAgent):
     """Agent for filtering high-quality data sources and research using SmolAgents"""
     
-    def __init__(self, model: OpenAIModel, memory: ConversationMemory = None):
+    def __init__(self, model: OpenAIModel, memory: AgentMemory = None):
         super().__init__(
             name="DeepResearcherAgent",
             model=model,
-            memory=memory or ConversationMemory()
+            memory=memory or AgentMemory(system_prompt="You are a deep researcher agent that filters and extracts high-quality data sources.")
         )
         
         # Add research tools
