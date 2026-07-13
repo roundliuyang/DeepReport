@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from enum import Enum
 import asyncio
 import logging
-from smolagents import Agent, Tool
-from smolagents.memory import Memory
+from smolagents import ToolCallingAgent, Tool
+from smolagents.memory import AgentMemory
 from smolagents.models import Model
 
 logging.basicConfig(level=logging.INFO)
@@ -46,11 +46,22 @@ class TaskResult:
         if self.metadata is None:
             self.metadata = {}
 
-class BaseAgent(Agent, ABC):
+class BaseAgent(ToolCallingAgent, ABC):
     """Base class for all agents in the system using SmolAgents framework"""
     
-    def __init__(self, name: str, model: Model, memory: Memory = None, tools: List[Tool] = None):
-        super().__init__(name=name, model=model, memory=memory, tools=tools or [])
+    def __init__(self, name: str, model: Model, memory: AgentMemory = None, tools: List[Tool] = None, system_prompt: str = None):
+        # Create default memory if not provided
+        if memory is None:
+            prompt = system_prompt or f"You are {name}, a specialized AI assistant."
+            memory = AgentMemory(system_prompt=prompt)
+        
+        # Store memory for later use (smolagents 1.26.0 doesn't accept memory parameter)
+        self.agent_memory = memory
+        
+        # Initialize ToolCallingAgent without memory parameter
+        super().__init__(tools=tools or [], model=model)
+        
+        self.name = name
         self.status = AgentStatus.IDLE
         self.task_queue = asyncio.Queue()
         self.completed_tasks = {}
@@ -126,16 +137,23 @@ class BaseAgent(Agent, ABC):
     async def run_task_with_smolagents(self, task_description: str, tools: List[Tool] = None) -> Dict[str, Any]:
         """Run a task using SmolAgents framework"""
         try:
-            # Use SmolAgents to run the task
-            result = await self.run(task_description, tools=tools)
-            return {"success": True, "result": result}
+            # Use SmolAgents to run the task (run() is synchronous in smolagents 1.26.0)
+            result = self.run(task_description, tools=tools)
+            return {"success": True, "result": str(result)}
         except Exception as e:
             logger.error(f"SmolAgents task execution failed: {e}")
             return {"success": False, "error": str(e)}
     
     def add_custom_tool(self, tool: Tool):
         """Add a custom tool to the agent"""
-        self.tools.append(tool)
+        # In smolagents 1.26.0, self.tools is a dict keyed by tool name
+        if hasattr(self, 'tools'):
+            if isinstance(self.tools, dict):
+                self.tools[tool.name] = tool
+            else:
+                self.tools.append(tool)
+        else:
+            self.tools = {tool.name: tool}
         logger.info(f"Added tool {tool.name} to {self.name}")
     
     def get_tools_info(self) -> List[Dict[str, Any]]:
@@ -144,7 +162,7 @@ class BaseAgent(Agent, ABC):
             {
                 "name": tool.name,
                 "description": tool.description,
-                "parameters": tool.parameters if hasattr(tool, 'parameters') else {}
+                "parameters": getattr(tool, 'inputs', {})
             }
             for tool in self.tools
         ]
