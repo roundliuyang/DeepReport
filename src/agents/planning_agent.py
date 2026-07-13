@@ -4,7 +4,7 @@ from datetime import datetime
 import json
 import logging
 from smolagents import Tool
-from smolagents.memory import ConversationMemory
+from smolagents.memory import AgentMemory
 from smolagents.models import OpenAIModel
 
 from .base_agent import BaseAgent, Task, TaskResult
@@ -15,28 +15,28 @@ class PlanningTool(Tool):
     """Tool for creating research plans"""
     
     def __init__(self):
-        super().__init__(
-            name="create_research_plan",
-            description="Create a comprehensive research plan for financial topics",
-            parameters={
-                "research_topic": {
-                    "type": "string",
-                    "description": "The financial research topic to plan"
-                },
-                "requirements": {
-                    "type": "array",
-                    "description": "List of specific requirements for the research",
-                    "items": {"type": "string"}
-                },
-                "output_format": {
-                    "type": "string",
-                    "description": "Desired output format (html, markdown, json)",
-                    "default": "html"
-                }
+        super().__init__()
+        self.name = "create_research_plan"
+        self.description = "Create a comprehensive research plan for financial topics"
+        self.inputs = {
+            "research_topic": {
+                "type": "string",
+                "description": "The financial research topic to plan"
+            },
+            "requirements": {
+                "type": "array",
+                "description": "List of specific requirements for the research",
+                "nullable": True
+            },
+            "output_format": {
+                "type": "string",
+                "description": "Desired output format (html, markdown, json)",
+                "nullable": True
             }
-        )
+        }
+        self.output_type = "object"
     
-    async def run(self, research_topic: str, requirements: List[str] = None, output_format: str = "html") -> Dict[str, Any]:
+    def forward(self, research_topic: str, requirements: List[str] = None, output_format: str = "html") -> Dict[str, Any]:
         """Create a research plan"""
         prompt = f"""
 You are an expert financial research planner. Given a research topic, decompose it into executable sub-tasks that can be handled by specialized agents.
@@ -90,11 +90,11 @@ Ensure the tasks are logically ordered and dependencies are correctly specified.
 class PlanningAgent(BaseAgent):
     """Planning agent that decomposes complex research tasks into sub-tasks using SmolAgents"""
     
-    def __init__(self, model: OpenAIModel, memory: ConversationMemory = None):
+    def __init__(self, model: OpenAIModel, memory: AgentMemory = None):
         super().__init__(
             name="PlanningAgent",
             model=model,
-            memory=memory or ConversationMemory()
+            memory=memory or AgentMemory(system_prompt="You are a planning agent that decomposes complex research tasks into sub-tasks.")
         )
         
         # Add planning tools
