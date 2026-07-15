@@ -20,6 +20,7 @@ from src.report import HTMLReportGenerator
 from config import config, get_model_config
 from smolagents import OpenAIModel
 from smolagents.memory import AgentMemory
+from smolagents.models import ChatMessage
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -60,7 +61,7 @@ class DeepReportApp:
         """Initialize all agents using SmolAgents framework"""
         try:
             # Initialize SmolAgents model
-            model = OpenAIModel(
+            self.model = OpenAIModel(
                 model_id=self.model_config.get("model", "gpt-4o"),
                 api_key=self.model_config.get("api_key", os.getenv("OPENAI_API_KEY")),
                 api_base=self.model_config.get("base_url", "https://api.chatanywhere.tech/v1")
@@ -70,13 +71,13 @@ class DeepReportApp:
             memory = AgentMemory(system_prompt="You are DeepReport, an AI-powered financial research assistant.")
 
             # Initialize planning agent
-            self.agents["planning"] = PlanningAgent(model, memory)
+            self.agents["planning"] = PlanningAgent(self.model, memory)
             
             # Initialize sub-agents
-            self.agents["deep_researcher"] = DeepResearcherAgent(model, memory)
-            self.agents["browser"] = BrowserAgent(model, memory)
-            self.agents["deep_analyze"] = DeepAnalyzeAgent(model, memory)
-            self.agents["final_answer"] = FinalAnswerAgent(model, memory)
+            self.agents["deep_researcher"] = DeepResearcherAgent(self.model, memory)
+            self.agents["browser"] = BrowserAgent(self.model, memory)
+            self.agents["deep_analyze"] = DeepAnalyzeAgent(self.model, memory)
+            self.agents["final_answer"] = FinalAnswerAgent(self.model, memory)
             
             logger.info("All agents initialized successfully with SmolAgents framework")
             
@@ -96,12 +97,48 @@ class DeepReportApp:
             
             logger.info(f"Starting report generation for topic: {research_topic}")
             
-            # Step 1: Create research plan
-            plan_dict = await self.agents["planning"].create_research_plan(
-                research_topic=research_topic,
-                requirements=requirements_list,
-                output_format=output_format
-            )
+            # Step 1: Create research plan - directly call model.generate() to skip useless tool loop
+            planning_prompt = f"""You are an expert financial research planner. Create a comprehensive research plan as a JSON object.
+
+Research Topic: {research_topic}
+Requirements: {', '.join(requirements_list) if requirements_list else 'None specified'}
+Output Format: {output_format}
+
+Respond ONLY with a valid JSON object in this exact format:
+{{
+    "overview": "Brief description of the research approach",
+    "tasks": [
+        {{
+            "task_id": "task_001",
+            "task_type": "deep_researcher",
+            "description": "What the task should accomplish",
+            "parameters": {{}},
+            "dependencies": [],
+            "priority": 1,
+            "estimated_duration": 30
+        }}
+    ],
+    "expected_output": "What the final report should contain",
+    "data_sources": ["string"],
+    "citations_required": ["string"],
+    "estimated_duration": 0
+}}
+
+Use task_type from: deep_researcher, browser_use, deep_analyze, final_answer.
+Include 3-5 tasks covering research, data collection, analysis, and final summary."""
+
+            messages = [ChatMessage(role="user", content=planning_prompt)]
+            response = self.model.generate(messages)
+            response_text = response.content if hasattr(response, 'content') else str(response)
+            
+            # 剥离 markdown 代码块包裹，直接解析 JSON
+            plan_text = response_text.strip()
+            if plan_text.startswith("```"):
+                plan_text = "\n".join(l for l in plan_text.split("\n")[1:] if not l.strip().startswith("```"))
+            
+            plan_dict = json.loads(plan_text)
+            if "tasks" not in plan_dict or not isinstance(plan_dict["tasks"], list):
+                return {"success": False, "error": "Invalid plan format: missing tasks list"}
 
             # Step 2: Execute research tasks
             task_results = await self._execute_research_plan(plan_dict)
@@ -630,20 +667,7 @@ class DeepReportApp:
         The report provides actionable insights based on current market conditions and reliable data sources.
         """
 
-    def _generate_fallback_plan(self, research_topic: str, requirements_list: List[str]) -> Dict[str, Any]:
-        """Generate a fallback research plan when JSON parsing fails"""
-        return {
-            "research_topic": research_topic,
-            "requirements": requirements_list,
-            "tasks": [
-                {
-                    "task_id": "task_001",
-                    "task_type": "deep_research",
-                    "description": f"Research and analyze: {research_topic}",
-                    "priority": "high"
-                }
-            ]
-        }
+
 
 
 # Create global app instance
