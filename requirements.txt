@@ -32,3 +32,4 @@ chromedriver-autoinstaller==0.6.4
 yfinance==0.2.40
 financial-datasets==0.1.0
 smolagents==1.26.0
+litellm==1.60.0

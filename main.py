@@ -5,10 +5,14 @@ Main application with Gradio frontend
 """
 
 import asyncio
+import copy
+from html import escape
+from urllib.parse import urlparse
 import gradio as gr
 import logging
 import json
 import os
+import re
 from datetime import datetime
 from typing import Dict, Any, List, Optional
 
@@ -17,8 +21,11 @@ from src.agents.sub_agents import DeepResearcherAgent, BrowserAgent, DeepAnalyze
 from src.search import SearchManager
 from src.utils import ModelAdapter, MCPManager
 from src.report import HTMLReportGenerator
+from src.report.section_renderer import render_sections
+from src.report.research_writer import ResearchWriter
+from src.report.research_sources import ResearchTrace, review_sources, search_queries
 from config import config, get_model_config
-from smolagents import OpenAIModel
+from smolagents import OpenAIModel, LiteLLMModel
 from smolagents.memory import AgentMemory
 from smolagents.models import ChatMessage
 
@@ -61,12 +68,22 @@ class DeepReportApp:
         """Initialize all agents using SmolAgents framework"""
         try:
             # Initialize SmolAgents model
-            self.model = OpenAIModel(
-                model_id=self.model_config.get("model", "gpt-4o"),
-                api_key=self.model_config.get("api_key", os.getenv("OPENAI_API_KEY")),
-                api_base=self.model_config.get("base_url", "https://api.chatanywhere.tech/v1")
-            )
-            
+            model_id = self.model_config.get("model", "gpt-4o")
+            if not self.model_config.get("api_key"):
+                raise ValueError(f"No API key configured for model {model_id}")
+            if "claude" in model_id.lower():
+                self.model = LiteLLMModel(
+                    model_id=f"anthropic/{model_id}",
+                    api_key=self.model_config["api_key"]
+                )
+            else:
+                self.model = OpenAIModel(
+                    model_id=model_id,
+                    api_key=self.model_config["api_key"],
+                    api_base=self.model_config.get("base_url", "https://api.chatanywhere.tech/v1"),
+                    client_kwargs={"timeout": 90.0, "max_retries": 1}
+                )
+
             # Initialize memory
             memory = AgentMemory(system_prompt="You are DeepReport, an AI-powered financial research assistant.")
 
@@ -85,7 +102,23 @@ class DeepReportApp:
             logger.error(f"Failed to initialize agents: {e}")
             raise
     
-    async def generate_report(self, 
+    async def generate_report(self, research_topic: str, requirements: str,
+                              output_format: str = "html", model: str = "gpt-4o") -> Dict[str, Any]:
+        # Each request gets its own model and agents; concurrent requests cannot switch each other.
+        try:
+            request_app = copy.copy(self)
+            request_app.model_config = get_model_config(model)
+            request_app.agents = {}
+            request_app.trace = ResearchTrace(config.output_dir)
+            request_app._initialize_agents()
+            result = await request_app._generate_report(research_topic, requirements, output_format, model)
+            result['trace_path'] = str(request_app.trace.path)
+            request_app.trace.record('result', result)
+            return result
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+
+    async def _generate_report(self,
                             research_topic: str,
                             requirements: str,
                             output_format: str = "html",
@@ -125,10 +158,23 @@ Respond ONLY with a valid JSON object in this exact format:
 }}
 
 Use task_type from: deep_researcher, browser_use, deep_analyze, final_answer.
-Include 3-5 tasks covering research, data collection, analysis, and final summary."""
+Include 3-5 tasks covering research, data collection, analysis, and final summary.
+Every analysis task must depend on research/data collection tasks; final_answer must depend on analysis.
+Never invent URLs or PDF filenames from memory. Use url/pdf_path only if explicitly supplied
+by the user; otherwise provide parameters.query to discover a real source at execution time.
+Keep document dates and planning periods relevant to the research topic. Set exact_target=true
+only when the user requires that specific document/page rather than research on its subject.
+For browser_use, parameters must include browser_task_type
+(web_navigation, pdf_analysis, structured_data_extraction, form_interaction).
+Browser actions must be structured objects: {{"type": "click|fill|scroll|extract", "target": "CSS selector", "value": "optional"}}.
+For ordinary reading/extraction, omit action/actions. Use browser_task_type=web_navigation.
+Never invent CSS selectors for pages that have not been inspected.
+Browser tasks should depend on the relevant research tasks so they can use the discovered URLs.
+exact_target must be a JSON boolean and requires a user-supplied url or pdf_path.
+Use concise search queries in parameters.query for research or browser tasks without a URL."""
 
             messages = [ChatMessage(role="user", content=planning_prompt)]
-            response = self.model.generate(messages)
+            response = await asyncio.to_thread(self.model.generate, messages)
             response_text = response.content if hasattr(response, 'content') else str(response)
             
             # 剥离 markdown 代码块包裹，直接解析 JSON
@@ -136,12 +182,22 @@ Include 3-5 tasks covering research, data collection, analysis, and final summar
             if plan_text.startswith("```"):
                 plan_text = "\n".join(l for l in plan_text.split("\n")[1:] if not l.strip().startswith("```"))
             
+            if getattr(self, 'trace', None):
+                self.trace.record('planning', {'topic': research_topic, 'response': response_text})
             plan_dict = json.loads(plan_text)
             if "tasks" not in plan_dict or not isinstance(plan_dict["tasks"], list):
                 return {"success": False, "error": "Invalid plan format: missing tasks list"}
 
             # Step 2: Execute research tasks
+            plan_dict["research_topic"] = research_topic
+            plan_dict["requirements"] = requirements_list
             task_results = await self._execute_research_plan(plan_dict)
+            failed = {key: value.get("error", "Task failed") for key, value in task_results.items()
+                      if not value.get("success")}
+            if failed or not task_results:
+                return {"success": False, "error": "Research plan incomplete",
+                        "failed_tasks": failed, "task_results": task_results}
+
 
             # Step 3: Generate final report
             report_data = {
@@ -202,177 +258,274 @@ Include 3-5 tasks covering research, data collection, analysis, and final summar
     
     async def _execute_research_plan(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         """Execute research tasks from the plan"""
+        tasks = plan.get("tasks", [])
+        if not tasks:
+            raise ValueError("Research plan contains no tasks")
+        handlers = {
+            "deep_research": self._execute_deep_research_task,
+            "deep_researcher": self._execute_deep_research_task,
+            "browser": self._execute_browser_task, "browser_use": self._execute_browser_task,
+            "deep_analyze": self._execute_analysis_task, "final_answer": self._execute_final_task
+        }
+        pending = {}
+        for task in tasks:
+            task_id = task.get("task_id")
+            if not task_id or task_id in pending:
+                raise ValueError("Task IDs must be present and unique")
+            if task.get("task_type") not in handlers:
+                raise ValueError(f"Unknown task type: {task.get('task_type')}")
+            if not isinstance(task.get("parameters", {}), dict):
+                raise ValueError(f"Invalid parameters for {task_id}")
+            if not isinstance(task.get("dependencies", []), list):
+                raise ValueError(f"Invalid dependencies for {task_id}")
+            pending[task_id] = task
+        for task in tasks:
+            if any(dep not in pending for dep in task.get("dependencies", [])):
+                raise ValueError(f"Unknown dependency for {task['task_id']}")
         task_results = {}
-        
-        for task in plan.get("tasks", []):
-            task_id = task["task_id"]
-            task_type = task["task_type"]
-            
-            try:
-                if task_type == "deep_research" or task_type == "deep_researcher":
-                    result = await self._execute_deep_research_task(task)
-                elif task_type == "browser_use" or task_type == "browser":
-                    result = await self._execute_browser_task(task)
-                elif task_type == "deep_analyze":
-                    result = await self._execute_analysis_task(task)
-                elif task_type == "final_answer":
-                    result = await self._execute_final_task(task)
+        while pending:
+            ready = [task for task in pending.values()
+                     if all(dep in task_results for dep in task.get("dependencies", []))]
+            if not ready:
+                raise ValueError("Research plan contains a dependency cycle")
+            for task in ready:
+                task_id = task["task_id"]
+                dependencies = task.get("dependencies", [])
+                failed = [dep for dep in dependencies if not task_results[dep].get("success")]
+                if failed:
+                    task_results[task_id] = {"success": False, "error": f"Failed dependencies: {failed}",
+                                             "task_type": task["task_type"]}
                 else:
-                    logger.warning(f"Unknown task type: {task_type}")
-                    continue
-                
-                task_results[task_id] = result if isinstance(result, dict) else {"success": True, "data": str(result), "task_type": task_type}
-                
-            except Exception as e:
-                logger.error(f"Failed to execute task {task_id}: {e}")
-                task_results[task_id] = {"error": str(e)}
-        
+                    prepared = dict(task)
+                    # Include completed evidence as well as explicitly declared dependencies.
+                    prepared["context"] = {
+                        "research_topic": plan.get("research_topic", ""),
+                        "requirements": plan.get("requirements", []),
+                        "task_results": {key: value for key, value in task_results.items() if value.get("success")}
+                    }
+                    try:
+                        task_results[task_id] = await handlers[task["task_type"]](prepared)
+                    except Exception as exc:
+                        task_results[task_id] = {"success": False, "error": str(exc)}
+                del pending[task_id]
         return task_results
-    
+
+    @staticmethod
+    def _normalize_browser_parameters(parameters):
+        parameters = dict(parameters)
+        exact = parameters.get("exact_target", False)
+        if isinstance(exact, str) and exact.lower() in ("true", "false"):
+            parameters["exact_target"] = exact.lower() == "true"
+        elif not isinstance(exact, bool):
+            raise ValueError("exact_target must be true or false")
+        aliases = {"extract_content", "content_extraction", "read", "browse", "navigate"}
+        if parameters.get("browser_task_type") in aliases:
+            parameters["browser_task_type"] = "web_navigation"
+        # Planning models sometimes describe reading as an action. It is not a form/click operation.
+        for key in ("action", "actions"):
+            value = parameters.get(key)
+            actions = value if isinstance(value, list) else [value] if value else []
+            executable = []
+            for action in actions:
+                if isinstance(action, str):
+                    read_only = re.search(r"read|extract|scrape|collect|brows|navigat|analy[sz]|提取|读取|阅读|收集|浏览|分析", action, re.I)
+                    changes_page = re.search(r"click|fill|submit|login|log in|purchase|delete|点击|填写|提交|登录|购买|删除", action, re.I)
+                    if read_only and not changes_page:
+                        continue
+                    raise ValueError("Browser interaction requires a structured action with type and target")
+                if not isinstance(action, dict):
+                    raise ValueError("Browser actions must be objects")
+                if action.get("type") in aliases and not action.get("target"):
+                    continue
+                if action.get("type") == "extract" and not action.get("target"):
+                    continue
+                executable.append(action)
+            if executable:
+                parameters[key] = executable if key == "actions" else executable[0]
+            else:
+                parameters.pop(key, None)
+        return parameters
+
     async def _execute_browser_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute browser task - use search to find real URLs then extract content"""
+        """Fetch research sources with bounded rediscovery after a read-only target fails."""
+        from src.agents.base_agent import Task
+        from src.agents.deep_researcher_agent import SourceDiscoveryTool
         try:
-            from src.agents.deep_researcher_agent import SourceDiscoveryTool, ContentExtractionTool
+            original = self._normalize_browser_parameters(task.get("parameters", {}))
+        except ValueError as exc:
+            return {"success": False, "task_type": "browser", "error": str(exc)}
+        target = original.get("pdf_path") or original.get("url")
+        actions = original.get("actions", []) + ([original["action"]] if original.get("action") else [])
+        interactive = any(action.get("type") != "extract" for action in actions) or any(
+            original.get(key) for key in ("form_data", "submit_button")) or original.get("browser_task_type") == "form_interaction"
+        if not target and (interactive or original.get("exact_target")):
+            return {"success": False, "task_type": "browser",
+                    "error": "An exact-target or interactive browser task requires an explicit url or pdf_path"}
+        can_discover = not interactive and not original.get("exact_target") and (
+            not target or urlparse(target).scheme in ("http", "https"))
+        attempts = []
+        visited = set()
 
-            # Use search to find real sources instead of letting agent hallucinate URLs
-            source_tool = SourceDiscoveryTool()
-            sources_result = source_tool.forward(task['description'], max_results=5)
-            sources = sources_result.get('sources', []) if isinstance(sources_result, dict) else []
+        async def fetch(parameters):
+            url = parameters.get("pdf_path") or parameters.get("url")
+            visited.add(url)
+            try:
+                result = await self.agents["browser"].execute_task(Task(
+                    id=task["task_id"], type="browser", description=task["description"], parameters=parameters))
+                if not result.success:
+                    raise ValueError(result.error or "Browser task failed")
+                data = result.result
+                content = data.get("full_text") or data.get("content") or data.get("result_content")
+                if not content and any(data.get("extracted_data", {}).values()):
+                    content = json.dumps(data["extracted_data"], ensure_ascii=False)
+                if not content or not content.strip():
+                    raise ValueError("Browser task returned no usable content")
+                source_url = data.get("url") or url
+                relevant = await self._review_sources(task, [{"url": source_url,
+                    "title": data.get("title", ""), "content": content, "content_length": len(content)}])
+                if not relevant:
+                    raise ValueError("Browser page does not contain relevant research evidence")
+                source = {"url": source_url, "title": data.get("title", source_url), "snippet": content[:300]}
+                return {"success": True, "task_type": "browser", "data": {
+                    "results": [source], "structured_data": {
+                        "browser_result": data, "sources": [source], "source_attempts": list(attempts),
+                        "requested_target": target,
+                        "extracted_content": [{"url": source_url, "content": content, "content_length": len(content)}]}}}
+            except Exception as exc:
+                attempts.append({"url": url, "error": str(exc)})
+                return None
 
-            extracted_content = []
-            if sources:
-                content_tool = ContentExtractionTool()
-                urls = [s['url'] for s in sources[:3]]
-                content_result = content_tool.forward(urls, max_content_length=2000)
-                if isinstance(content_result, dict):
-                    extracted_content = content_result.get('extracted_content', [])
+        if target:
+            result = await fetch(original)
+            if result:
+                return result
+        if can_discover:
+            query = original.get("query") or task["description"]
+            topic = task.get("context", {}).get("research_topic", "")
+            if topic:
+                query = f"{topic} {query}"
+            # Preserve the requested authority and document format when replacing a broken link.
+            domain = (urlparse(target).hostname or "").removeprefix("www.") if target else ""
+            if domain:
+                query += f" site:{domain}"
+            pdf_only = original.get("browser_task_type") == "pdf_analysis" or bool(original.get("pdf_path")) or bool(target and urlparse(target).path.lower().endswith(".pdf"))
+            if pdf_only:
+                query += " filetype:pdf"
+            try:
+                # A targetless browser task should consume the discovery stage's URLs first.
+                if not target:
+                    prior = task.get("context", {}).get("task_results", {})
+                    candidates = []
+                    for task_id in task.get("dependencies") or prior:
+                        result = prior.get(task_id, {})
+                        if not result.get("success"):
+                            continue
+                        data = result.get("data", {})
+                        candidates.extend(data.get("structured_data", {}).get("extracted_content", []))
+                        candidates.extend(data.get("results", []))
+                    tried = 0
+                    for source in candidates:
+                        candidate = source.get("url", "")
+                        parsed = urlparse(candidate)
+                        if parsed.scheme not in ("http", "https") or candidate in visited:
+                            continue
+                        if pdf_only and not parsed.path.lower().endswith(".pdf"):
+                            continue
+                        parameters = dict(original, url=candidate)
+                        if parsed.path.lower().endswith(".pdf"):
+                            parameters["browser_task_type"] = "pdf_analysis"
+                        result = await fetch(parameters)
+                        if result:
+                            return result
+                        tried += 1
+                        if tried >= 3:
+                            break
+                discovery = await asyncio.to_thread(SourceDiscoveryTool().forward, query, max_results=5)
+                if discovery.get("error"):
+                    raise ValueError(discovery["error"])
+                for source in discovery.get("sources", [])[:5]:
+                    candidate = source.get("url", "")
+                    parsed = urlparse(candidate)
+                    host = parsed.hostname or ""
+                    if parsed.scheme not in ("http", "https") or candidate in visited:
+                        continue
+                    if domain and host != domain and not host.endswith("." + domain):
+                        continue
+                    parameters = dict(original)
+                    parameters.pop("pdf_path", None)
+                    parameters["url"] = candidate
+                    if pdf_only:
+                        parameters["browser_task_type"] = "pdf_analysis"
+                    elif parsed.path.lower().endswith(".pdf"):
+                        parameters["browser_task_type"] = "pdf_analysis"
+                    result = await fetch(parameters)
+                    if result:
+                        return result
+            except Exception as exc:
+                attempts.append({"query": query, "error": str(exc)})
+        detail = "; ".join(item["error"] for item in attempts) or "No usable browser targets found"
+        return {"success": False, "task_type": "browser", "error": detail, "source_attempts": attempts}
 
-            return {
-                "success": True,
-                "data": {
-                    "agent_response": f"Found {len(sources)} sources, extracted {len(extracted_content)} contents",
-                    "results": sources,
-                    "structured_data": {
-                        "sources": sources,
-                        "extracted_content": extracted_content
-                    }
-                },
-                "task_type": "browser",
-                "execution_time": 0
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "task_type": "browser"
-            }
-    
+    async def _review_sources(self, task, items):
+        return await review_sources(self.model, task.get('context', {}).get('research_topic') or task['description'],
+                                    task['description'], items, getattr(self, 'trace', None))
+
     async def _execute_deep_research_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute deep research task - directly call tools instead of using agent"""
+        from src.agents.deep_researcher_agent import SourceDiscoveryTool, ContentExtractionTool
+        topic = task.get('context', {}).get('research_topic') or task['description']
+        queries = search_queries(task.get('parameters', {}).get('query') or topic, topic)
+        seen, accepted, search_attempts = set(), [], []
         try:
-            from src.agents.deep_researcher_agent import SourceDiscoveryTool, ContentExtractionTool
+            for query in queries:
+                discovery = await asyncio.to_thread(SourceDiscoveryTool().forward, query, max_results=10)
+                if getattr(self, 'trace', None):
+                    self.trace.record('search', {'task_id': task['task_id'], 'query': query, 'result': discovery})
+                search_attempts.append({'query': query, 'error': discovery.get('error')})
+                sources = discovery.get('sources', [])
+                urls = [item['url'] for item in sources if item.get('url') and item['url'] not in seen][:5]
+                seen.update(urls)
+                if not urls:
+                    continue
+                extraction = await asyncio.to_thread(ContentExtractionTool().forward, urls, max_content_length=12000)
+                contents = extraction.get('extracted_content', [])
+                if getattr(self, 'trace', None):
+                    self.trace.record('extraction', {'task_id': task['task_id'], 'content': contents})
+                accepted.extend(await self._review_sources(task, contents))
+                # A second independent source provides cross-checking; otherwise try a different query.
+                accepted = list({item['url']: item for item in accepted}.values())
+                if len(accepted) >= 2:
+                    break
+            if not accepted:
+                raise ValueError('No relevant research content found after supplementary searches')
+            sources = [{'url': item['url'], 'title': item.get('title', item['url']),
+                        'domain': urlparse(item['url']).netloc, 'snippet': item['content'][:300]} for item in accepted]
+            return {'success': True, 'task_type': 'deep_research', 'data': {
+                'agent_response': f'Collected {len(accepted)} relevant research sources', 'results': sources,
+                'structured_data': {'sources': sources, 'extracted_content': accepted,
+                                    'search_attempts': search_attempts, 'total_sources': len(accepted),
+                                    'total_content_length': sum(len(item['content']) for item in accepted)}}}
+        except Exception as exc:
+            return {'success': False, 'task_type': 'deep_research', 'error': str(exc), 'search_attempts': search_attempts}
 
-            # Directly call the tools to get structured data
-            source_tool = SourceDiscoveryTool()
-            sources_result = source_tool.forward(task['description'], max_results=10)
-
-            extracted_sources = sources_result.get('sources', []) if isinstance(sources_result, dict) else []
-
-            # Extract content from top sources
-            extracted_content = []
-            if extracted_sources:
-                content_tool = ContentExtractionTool()
-                urls = [s['url'] for s in extracted_sources[:5]]  # Top 5 sources
-                content_result = content_tool.forward(urls, max_content_length=2000)
-
-                if isinstance(content_result, dict):
-                    extracted_content = content_result.get('extracted_content', [])
-
-            return {
-                "success": True,
-                "data": {
-                    "agent_response": f"Found {len(extracted_sources)} sources and extracted {len(extracted_content)} contents",
-                    "results": extracted_sources,
-                    "structured_data": {
-                        "sources": extracted_sources,
-                        "extracted_content": extracted_content,
-                        "total_sources": len(extracted_sources),
-                        "total_content_length": sum(c.get('content_length', 0) for c in extracted_content)
-                    }
-                },
-                "task_type": "deep_research",
-                "execution_time": 0
-            }
-        except Exception as e:
-            logger.error(f"Deep research task failed: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "task_type": "deep_research"
-            }
-    
     async def _execute_analysis_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute analysis task"""
-        try:
-            result = self.agents["deep_analyze"].run(
-                f"Perform deep financial analysis for: {task['description']}",
-                max_steps=3
-            )
+        return await self._write_research_task(task, "analysis")
 
-            # Convert AgentText to string if needed
-            if hasattr(result, '__str__') and not isinstance(result, str):
-                result_str = str(result)
-            else:
-                result_str = result
-
-            return {
-                "success": True,
-                "data": {
-                    "agent_response": result_str,
-                    "results": [],
-                    "structured_data": {}
-                },
-                "task_type": "analysis",
-                "execution_time": 0  # SmolAgents handles timing internally
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "task_type": "analysis"
-            }
-    
     async def _execute_final_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute final task"""
+        return await self._write_research_task(task, "final")
+
+    async def _write_research_task(self, task: Dict[str, Any], stage: str) -> Dict[str, Any]:
         try:
-            result = self.agents["final_answer"].run(
-                f"Generate final report for: {task['description']}",
-                max_steps=3
-            )
+            document = await ResearchWriter(self.model, getattr(self, 'trace', None)).write(task, stage)
+            content = ResearchWriter.render_text(document)
+            data = {"agent_response": content, "research_document": document,
+                    "results": [], "structured_data": {}}
+            if stage == "final":
+                data.update(report_content=content, format="text")
+            return {"success": True, "data": data, "task_type": stage,
+                    "task_description": task["description"]}
+        except Exception as exc:
+            return {"success": False, "error": str(exc), "task_type": stage}
 
-            # Convert AgentText to string if needed
-            if hasattr(result, '__str__') and not isinstance(result, str):
-                result_str = str(result)
-            else:
-                result_str = result
-
-            return {
-                "success": True,
-                "data": {
-                    "agent_response": result_str,
-                    "report_content": result_str,
-                    "format": "html"
-                },
-                "task_type": "final",
-                "execution_time": 0  # SmolAgents handles timing internally
-            }
-        except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "task_type": "final"
-            }
-    
     def _extract_chart_data(self, task_results: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Extract chart data from task results"""
         chart_data = []
@@ -474,100 +627,9 @@ Include 3-5 tasks covering research, data collection, analysis, and final summar
         return sources
     
     def _create_report_sections(self, task_results: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Create report sections from task results"""
-        sections = []
-        
-        # Methodology section
-        sections.append({
-            "id": "methodology",
-            "title": "Research Methodology",
-            "content": """
-            <p>This report was generated using DeepReport's AI-powered research system. 
-            The research process involved:</p>
-            <ul>
-                <li>Automated web search across multiple search engines</li>
-                <li>Content extraction and analysis</li>
-                <li>Data visualization and chart generation</li>
-                <li>Citation tracking and source verification</li>
-            </ul>
-            <p>Each step was executed by specialized AI agents working in coordination.</p>
-            """
-        })
-        
-        # Search results section
-        search_results = []
-        extracted_contents = []
-        for task_id, result in task_results.items():
-            if result.get("success") and result.get("task_type") in ["deep_research", "browser"]:
-                data = result["data"]
-                if isinstance(data, dict):
-                    if "results" in data:
-                        search_results.extend(data["results"])
-                    if "structured_data" in data and "extracted_content" in data["structured_data"]:
-                        extracted_contents.extend(data["structured_data"]["extracted_content"])
+        """Create semantic report sections from structured research results."""
+        return render_sections(task_results)
 
-        # Add extracted content section first (most important)
-        if extracted_contents:
-            content_html = "<div class='row'>"
-            for i, content_item in enumerate(extracted_contents[:5]):  # Top 5 contents
-                url = content_item.get('url', '#')
-                text = content_item.get('content', '')
-                length = content_item.get('content_length', len(text))
-
-                # Truncate long content for display
-                preview = text[:500] + '...' if len(text) > 500 else text
-                preview = preview.replace('\n', '<br>')
-
-                content_html += f"""
-                <div class='col-md-12 mb-4'>
-                    <div class='card'>
-                        <div class='card-header bg-primary text-white'>
-                            <h6 class='mb-0'><i class='fas fa-file-alt'></i> Source Content {i + 1}</h6>
-                        </div>
-                        <div class='card-body'>
-                            <p class='text-muted small'>URL: <a href='{url}' target='_blank'>{url[:80]}...</a></p>
-                            <p class='text-muted small'>Length: {length} characters</p>
-                            <div class='alert alert-light' style='max-height: 300px; overflow-y: auto;'>
-                                {preview}
-                            </div>
-                        </div>
-                    </div>
-                </div>
-                """
-            content_html += "</div>"
-
-            sections.append({
-                "id": "extracted_content",
-                "title": "Extracted Research Content",
-                "content": content_html
-            })
-
-        if search_results:
-            search_content = "<div class='row'>"
-            for i, result in enumerate(search_results[:10]):  # Limit to top 10
-                search_content += f"""
-                <div class='col-md-6 mb-3'>
-                    <div class='card'>
-                        <div class='card-body'>
-                            <h6 class='card-title'>{result.get('title', 'Untitled')}</h6>
-                            <p class='card-text small'>{result.get('snippet', 'No description available')}</p>
-                            <a href='{result.get('url', '#')}' class='btn btn-outline-primary btn-sm' target='_blank'>
-                                View Source
-                            </a>
-                        </div>
-                    </div>
-                </div>
-                """
-            search_content += "</div>"
-            
-            sections.append({
-                "id": "search_results",
-                "title": "Search Results",
-                "content": search_content
-            })
-        
-        return sections
-    
     def _extract_key_metrics(self, task_results: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Extract key metrics from task results"""
         metrics = []
@@ -653,70 +715,34 @@ Include 3-5 tasks covering research, data collection, analysis, and final summar
     
     def _generate_executive_summary(self, plan: Dict[str, Any], task_results: Dict[str, Any]) -> str:
         """Generate executive summary"""
-        total_tasks = len(task_results)
-        successful_tasks = sum(1 for r in task_results.values() if r.get("success"))
-        total_results = sum(
-            len(r.get("data", {}).get("results", [])) for r in task_results.values() if r.get("success"))
-
-        return f"""
-        This financial research report was generated using AI-powered analysis of {total_results} data points 
-        across {successful_tasks} successful research tasks. The research focused on {plan.get('research_topic', 'the specified topic')} 
-        and successfully completed {successful_tasks}/{total_tasks} planned research activities.
-        
-        Key findings include comprehensive market analysis, trend identification, and risk assessment. 
-        The report provides actionable insights based on current market conditions and reliable data sources.
-        """
-
-
+        for result in reversed(list(task_results.values())):
+            if result.get("success") and result.get("task_type") == "final":
+                return escape(result.get("data", {}).get("research_document", {}).get("summary", ""))
+        return ""
 
 
 # Create global app instance
 app = DeepReportApp()
 
+async def generate_report_interface(research_topic, requirements, output_format, model):
+    try:
+        result = await app.generate_report(research_topic, requirements, output_format, model)
+        if not result.get("success"):
+            detail = result.get("failed_tasks") or result.get("error", "Unknown error")
+            return gr.update(value="", visible=False), "Report generation failed", gr.update(
+                value=json.dumps(detail, ensure_ascii=False, indent=2), visible=True)
+        if output_format == "html":
+            return gr.update(value=result["report_html"], visible=True), (
+                f"Report generated successfully! File saved to: {result.get('report_path', '')}"
+            ), gr.update(value="", visible=False)
+        return gr.update(value="", visible=False), "Report data generated successfully!", gr.update(
+            value=json.dumps(result["report_data"], ensure_ascii=False, indent=2), visible=True)
+    except Exception as exc:
+        return gr.update(value="", visible=False), "Report generation failed", gr.update(value=str(exc), visible=True)
+
+
 def create_gradio_interface():
     """Create Gradio interface"""
-    
-    async def generate_report_interface(research_topic, requirements, output_format, model):
-        """Interface function for report generation"""
-        try:
-            result = await app.generate_report(
-                research_topic=research_topic,
-                requirements=requirements,
-                output_format=output_format,
-                model=model
-            )
-            
-            if result["success"]:
-                if output_format == "html" and "report_html" in result:
-                    return (
-                        result["report_html"],
-                        f"✅ Report generated successfully! File saved to: {result.get('report_path', 'Unknown')}",
-                        gr.update(visible=True),
-                        gr.update(visible=True)
-                    )
-                else:
-                    return (
-                        json.dumps(result["report_data"], indent=2),
-                        f"✅ Report data generated successfully!",
-                        gr.update(visible=False),
-                        gr.update(visible=True)
-                    )
-            else:
-                return (
-                    f"❌ Error: {result.get('error', 'Unknown error')}",
-                    "Report generation failed",
-                    gr.update(visible=False),
-                    gr.update(visible=True)
-                )
-                
-        except Exception as e:
-            error_msg = f"❌ Interface error: {str(e)}"
-            return (
-                error_msg,
-                "Report generation failed",
-                gr.update(visible=False),
-                gr.update(visible=True)
-            )
     
     # Define interface components
     with gr.Blocks(title="DeepReport - AI Financial Research", theme=gr.themes.Soft()) as demo:
@@ -795,7 +821,7 @@ def create_gradio_interface():
         generate_btn.click(
             fn=generate_report_interface,
             inputs=[research_topic, requirements, output_format, model],
-            outputs=[html_output, status_output, html_output, text_output]
+            outputs=[html_output, status_output, text_output]
         )
         
         # Example section

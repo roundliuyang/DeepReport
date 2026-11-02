@@ -160,3 +160,10 @@ Thumbs.db
 *.tmp
 *.temp
 *.backup
+
+# Local runtime state and environment overrides
+.gradio/
+.env.*
+!.env.example
+!.env.sample
+!.env.template

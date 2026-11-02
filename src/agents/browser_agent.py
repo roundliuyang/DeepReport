@@ -51,10 +51,13 @@ class BrowserUse:
             await self.browser.close()
         if self.playwright:
             await self.playwright.stop()
+        self.browser = self.context = self.page = self.playwright = None
     
     async def goto(self, url: str, timeout: int = 30000):
         """Navigate to URL"""
-        await self.page.goto(url, timeout=timeout, wait_until='domcontentloaded')
+        response = await self.page.goto(url, timeout=timeout, wait_until='domcontentloaded')
+        if response is not None and response.status >= 400:
+            raise ValueError(f"HTTP {response.status} while loading {url}")
     
     async def get_title(self) -> str:
         """Get page title"""
@@ -223,9 +226,6 @@ class WebNavigationTool(Tool):
         await self.browser.goto(url)
         
         # Extract basic page information
-        title = await self.browser.get_title()
-        content = await self.browser.get_text_content()
-        
         # Perform actions
         action_results = []
         if actions:
@@ -235,8 +235,8 @@ class WebNavigationTool(Tool):
         
         return {
             "url": url,
-            "title": title,
-            "content": content,
+            "title": await self.browser.get_title(),
+            "content": await self.browser.get_text_content(),
             "action_results": action_results,
             "timestamp": datetime.now().isoformat()
         }
@@ -302,78 +302,34 @@ class PDFAnalysisTool(Tool):
     def _analyze_pdf_sync(self, pdf_path: str, extract_tables: bool = True, extract_charts: bool = True) -> Dict[str, Any]:
         """Synchronous PDF analysis"""
         import requests
-        
-        # Check if it's a URL or local path
-        if pdf_path.startswith("http"):
-            # Download PDF from URL
-            response = requests.get(pdf_path)
-            if response.status_code == 200:
-                # Save to temporary file
-                with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as temp_file:
-                    temp_file.write(response.content)
-                    pdf_path = temp_file.name
-            else:
-                return {"error": f"Failed to download PDF: {response.status_code}"}
-        
-        # Analyze PDF using PyMuPDF
-        doc = fitz.open(pdf_path)
-        
-        analysis = {
-            "metadata": doc.metadata,
-            "page_count": len(doc),
-            "word_count": 0,
-            "sections": [],
-            "tables": [],
-            "charts": [],
-            "financial_data": [],
-            "full_text": ""
-        }
-        
-        # Extract text and analyze structure
-        full_text = ""
-        for page_num, page in enumerate(doc):
-            text = page.get_text()
-            full_text += text
-            
-            # Basic section detection
-            if text.strip():
-                analysis["sections"].append({
-                    "page": page_num + 1,
-                    "content": text[:500] + "..." if len(text) > 500 else text,
-                    "word_count": len(text.split())
-                })
-            
-            # Extract tables
-            if extract_tables:
-                tables = page.find_tables()
-                for table in tables:
-                    analysis["tables"].append({
-                        "page": page_num + 1,
-                        "rows": len(table.rows()),
-                        "cols": len(table.cols()),
-                        "data": table.extract()
-                    })
-            
-            # Look for financial data patterns
-            financial_indicators = ["$", "%", "revenue", "profit", "loss", "EBITDA", "EPS", "P/E"]
-            found_indicators = [indicator for indicator in financial_indicators if indicator.lower() in text.lower()]
-            if found_indicators:
-                analysis["financial_data"].append({
-                    "page": page_num + 1,
-                    "indicators": found_indicators,
-                    "context": text[:200]
-                })
-        
-        analysis["full_text"] = full_text
-        analysis["word_count"] = len(full_text.split())
-        
-        # Clean up temporary file if created
-        if pdf_path.startswith("/tmp/"):
-            os.unlink(pdf_path)
-        
-        doc.close()
-        
-        return analysis
+        downloaded = None
+        try:
+            if pdf_path.startswith(("http://", "https://")):
+                response = requests.get(pdf_path, timeout=30)
+                response.raise_for_status()
+                with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as handle:
+                    handle.write(response.content)
+                    downloaded = handle.name
+                pdf_path = downloaded
+            with fitz.open(pdf_path) as doc:
+                analysis = {"metadata": doc.metadata, "page_count": len(doc), "sections": [],
+                            "tables": [], "charts": [], "financial_data": []}
+                texts = []
+                for index, page in enumerate(doc):
+                    text = page.get_text()
+                    texts.append(text)
+                    analysis["sections"].append({"page": index + 1, "content": text})
+                    if extract_tables:
+                        for table in page.find_tables().tables:
+                            analysis["tables"].append({"page": index + 1, "rows": table.row_count,
+                                                       "cols": table.col_count, "data": table.extract()})
+                analysis["full_text"] = "\n".join(texts)
+                analysis["word_count"] = len(analysis["full_text"].split())
+                return analysis
+        finally:
+            if downloaded:
+                os.unlink(downloaded)
+
 
 class StructuredDataExtractionTool(Tool):
     """Tool for extracting structured data from web pages"""
@@ -415,6 +371,7 @@ class StructuredDataExtractionTool(Tool):
         structured_data = {
             "url": url,
             "title": await self.browser.get_title(),
+            "content": await self.browser.get_text_content(),
             "extracted_data": {}
         }
         
@@ -550,62 +507,47 @@ class BrowserAgent(BaseAgent):
     
     async def execute_task(self, task: Task) -> TaskResult:
         """Execute browser-related tasks using SmolAgents"""
-        start_time = datetime.now()
-        
+        parameters = task.parameters
+        target = parameters.get("pdf_path") or parameters.get("url")
+        task_type = parameters.get("browser_task_type")
+        if not task_type:
+            task_type = "pdf_analysis" if parameters.get("pdf_path") or (target and urlparse(target).path.lower().endswith(".pdf")) else "web_navigation"
         try:
-            task_type = task.parameters.get("browser_task_type")
-            url = task.parameters.get("url")
-            query = task.parameters.get("query")
-            action = task.parameters.get("action")
-            pdf_path = task.parameters.get("pdf_path")
-            
-            # Create task description for SmolAgents
-            task_description = f"Perform browser task: {task_type or 'web interaction'}"
-            
-            if url:
-                task_description += f" on {url}"
-            if query:
-                task_description += f" with query: {query}"
-            
-            # Use SmolAgents to orchestrate the task
-            result = await self.run_task_with_smolagents(task_description)
-            
-            if result.get("success"):
-                browser_result = result.get("result", {})
-                
-                # Enhance with specific browser operations
-                enhanced_result = await self._enhance_browser_result(browser_result, task)
-                
-                execution_time = (datetime.now() - start_time).total_seconds()
-                
-                return TaskResult(
-                    task_id=task.id,
-                    success=True,
-                    result=enhanced_result,
-                    execution_time=execution_time,
-                    metadata={
-                        "url": url,
-                        "query": query,
-                        "task_type": task_type,
-                        "action": action,
-                        "method": "smolagents"
-                    }
-                )
+            if not target:
+                raise ValueError("Browser task requires url or pdf_path")
+            if task_type == "pdf_analysis":
+                data = await asyncio.to_thread(PDFAnalysisTool().forward, target)
             else:
-                # Fallback to traditional method
-                fallback_result = await self._execute_traditional_browser_task(task)
-                fallback_result.execution_time = (datetime.now() - start_time).total_seconds()
-                return fallback_result
-                
-        except Exception as e:
-            execution_time = (datetime.now() - start_time).total_seconds()
-            return TaskResult(
-                task_id=task.id,
-                success=False,
-                error=str(e),
-                execution_time=execution_time
-            )
-    
+                await self.browser.start()
+                if task_type == "web_navigation":
+                    actions = parameters.get("actions", [])
+                    if parameters.get("action"):
+                        actions = [parameters["action"]]
+                    if not isinstance(actions, list) or any(not isinstance(action, dict) for action in actions):
+                        raise ValueError("Browser actions must be structured objects with type, target and optional value")
+                    data = await WebNavigationTool(self.browser)._navigate_and_perform(target, actions)
+                    if any(not item.get("success") for item in data["action_results"]):
+                        raise ValueError("One or more browser actions failed")
+                elif task_type == "structured_data_extraction":
+                    data = await StructuredDataExtractionTool(self.browser)._extract_data_async(
+                        target, parameters.get("data_types"))
+                elif task_type == "form_interaction":
+                    action = parameters.get("action") or {}
+                    data = await FormInteractionTool(self.browser)._interact_form_async(
+                        target, parameters.get("form_data", action.get("fields", {})),
+                        parameters.get("submit_button", action.get("submit")))
+                else:
+                    raise ValueError(f"Unknown browser task type: {task_type}")
+            if data.get("error"):
+                raise ValueError(data["error"])
+            return TaskResult(task_id=task.id, success=True, result=data)
+        except Exception as exc:
+            return TaskResult(task_id=task.id, success=False, error=str(exc))
+        finally:
+            if task_type != "pdf_analysis":
+                await self.browser.close()
+                self.browser_initialized = False
+
     async def _enhance_browser_result(self, smolagents_result: Dict[str, Any], task: Task) -> Dict[str, Any]:
         """Enhance SmolAgents result with browser-specific operations"""
         try:

@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import requests
+import re
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from urllib.parse import urlparse
@@ -66,12 +67,16 @@ class SourceDiscoveryTool(Tool):
             
             client = serpapi.Client(api_key=serper_api_key)
             search_result = client.search({
+                "engine": "google",
                 "q": query,
                 "num": max_results,
-                "hl": "en",
+                "hl": "zh-cn" if re.search(r"[\u4e00-\u9fff]", query) else "en",
                 "gl": "us"
             })
             
+            if search_result.get("error"):
+                raise RuntimeError(f"SerpAPI search failed: {search_result['error']}")
+
             # Parse and filter results
             sources = []
             high_quality_domains = [
@@ -114,8 +119,9 @@ class SourceDiscoveryTool(Tool):
             }
             
         except Exception as e:
-            logger.error(f"Source discovery failed: {e}")
-            return {"error": str(e), "sources": [], "total_found": 0}
+            error = re.sub(r'(?i)(api_key=)[^&\s)]+', r'\1[REDACTED]', str(e))
+            logger.error(f"Source discovery failed: {error}")
+            return {"error": error, "sources": [], "total_found": 0}
 
 class ContentExtractionTool(Tool):
     """Tool for extracting content from web sources"""
@@ -161,16 +167,20 @@ class ContentExtractionTool(Tool):
                     response = requests.get(url, headers=headers, timeout=10)
                     response.raise_for_status()
                     
-                    # Parse with BeautifulSoup
-                    soup = BeautifulSoup(response.content, 'html.parser')
-                    
-                    # Remove script and style elements
-                    for script in soup(["script", "style", "nav", "footer", "header"]):
-                        script.decompose()
-                    
-                    # Get text content
-                    text = soup.get_text(separator='\n', strip=True)
-                    
+                    if response.content.lstrip().startswith(b'%PDF'):
+                        import fitz
+                        with fitz.open(stream=response.content, filetype='pdf') as document:
+                            text = '\n'.join(page.get_text() for page in document)
+                            title = document.metadata.get('title') or response.url
+                    else:
+                        soup = BeautifulSoup(response.content, 'html.parser')
+                        title = soup.title.get_text(strip=True) if soup.title else ""
+                        for node in soup(["script", "style", "nav", "footer", "header", "noscript"]):
+                            node.decompose()
+                        containers = soup.select('article, main, [role="main"], .TRS_Editor, .article-content, .entry-content')
+                        root = max(containers, key=lambda node: len(node.get_text()), default=soup)
+                        text = root.get_text(separator='\n', strip=True)
+
                     # Clean up whitespace
                     lines = [line.strip() for line in text.split('\n') if line.strip()]
                     clean_text = '\n'.join(lines)
@@ -185,7 +195,9 @@ class ContentExtractionTool(Tool):
                         continue
                     
                     extracted_content.append({
-                        "url": url,
+                        "url": response.url,
+                        "requested_url": url,
+                        "title": title,
                         "content": clean_text,
                         "chunks_count": 1,
                         "content_length": len(clean_text)

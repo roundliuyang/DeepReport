@@ -694,6 +694,35 @@ class RiskAssessmentTool(Tool):
             if risk_categories is None:
                 risk_categories = ["financial", "operational", "market", "regulatory"]
             
+            required = {
+                "financial": ("debt_to_equity", "current_ratio", "profit_margin"),
+                "operational": ("operational_efficiency", "employee_turnover"),
+                "market": ("market_volatility", "competitive_pressure"),
+                "regulatory": ("regulatory_changes",)
+            }
+            missing = {}
+            for category in risk_categories:
+                fields = required.get(category)
+                if fields is None:
+                    missing[category] = ["unsupported risk category"]
+                    continue
+                invalid = []
+                for field in fields:
+                    value = data.get(field)
+                    if field == "regulatory_changes":
+                        valid = value in ("low", "medium", "high")
+                    else:
+                        import math
+                        valid = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+                    if not valid:
+                        invalid.append(field)
+                if invalid:
+                    missing[category] = invalid
+            if not risk_categories or missing:
+                return {"error": "Insufficient data for risk assessment", "overall_risk_level": "unknown",
+                        "missing_fields": missing, "risk_scores": {}, "risk_factors": [],
+                        "mitigation_strategies": []}
+
             assessment = {
                 "risk_categories": risk_categories,
                 "overall_risk_level": "medium",
@@ -731,47 +760,9 @@ class RiskAssessmentTool(Tool):
             return {"error": str(e)}
     
     async def _run_async(self, data: Dict[str, Any], risk_categories: List[str]) -> Dict[str, Any]:
-        """Async helper for risk assessment"""
-        try:
-            if risk_categories is None:
-                risk_categories = ["financial", "operational", "market", "regulatory"]
-            
-            assessment = {
-                "risk_categories": risk_categories,
-                "overall_risk_level": "medium",
-                "risk_scores": {},
-                "risk_factors": [],
-                "mitigation_strategies": []
-            }
-            
-            # Assess each risk category
-            total_score = 0
-            for category in risk_categories:
-                category_score = await self._assess_risk_category(data, category)
-                assessment["risk_scores"][category] = category_score
-                total_score += category_score
-            
-            # Calculate overall risk level
-            avg_score = total_score / len(risk_categories) if risk_categories else 0
-            if avg_score > 0.7:
-                assessment["overall_risk_level"] = "high"
-            elif avg_score > 0.4:
-                assessment["overall_risk_level"] = "medium"
-            else:
-                assessment["overall_risk_level"] = "low"
-            
-            # Generate risk factors
-            assessment["risk_factors"] = await self._identify_risk_factors(data, risk_categories)
-            
-            # Generate mitigation strategies
-            assessment["mitigation_strategies"] = await self._generate_mitigation_strategies(assessment)
-            
-            return assessment
-            
-        except Exception as e:
-            logger.error(f"Risk assessment failed: {e}")
-            return {"error": str(e)}
-    
+        """Use the same validation and calculations as the synchronous tool."""
+        return self.forward(data, risk_categories)
+
     def _assess_risk_category_sync(self, data: Dict[str, Any], category: str) -> float:
         """Assess risk for a specific category (synchronous)"""
         try:
