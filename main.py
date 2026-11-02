@@ -487,16 +487,53 @@ Use concise search queries in parameters.query for research or browser tasks wit
 
 
     async def _execute_research_plan(self, plan: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute research tasks from the plan"""
+        """按任务依赖逐批调度研究任务，收集成功、失败和被阻断的结果。
+
+        Args:
+            plan: 研究计划字典。tasks 是任务列表，每项包含 task_id、
+                task_type，以及可选的 parameters 字典和 dependencies 列表。
+                research_topic 和 requirements 会传入各任务的 context。
+
+        Returns:
+            以 task_id 为键的结果字典。成功结果通常包含 success、task_type
+            和 data；失败结果包含 success=False 和 error。
+            依赖失败的任务不会执行，但仍会记录失败结果；handler 抛出异常时
+            记录的结果仅包含 success 和 error，不保证存在 task_type。
+
+        Raises:
+            ValueError: 任务列表为空、ID 缺失或重复、任务类型不支持、参数或
+                依赖字段类型不合法、引用了不存在的依赖，或存在依赖环。
+                这些计划级错误向上层抛出；handler 执行异常则转为任务失败结果。
+
+        Notes:
+            ready 只要求依赖已有结果，不要求依赖成功，成功状态会另行检查。
+            同一批任务按计划中的顺序逐个 await，不并发执行，也不按 priority
+            排序。每次执行都传入当时所有已完成且成功的结果，而不只传直接依赖。
+            prepared 是任务字典的浅拷贝，新增 context 不改写原任务的顶层字段。
+
+        Examples:
+            最新运行 reports/runs/20261103_004034_9b3003eb/001_planning.json
+            的调度批次如下（实际五个任务均成功）：
+            第 1 批：task_001（无依赖，检索）。
+            第 2 批：task_002（依赖 task_001，浏览器读取）。
+            第 3 批：task_003、task_004（均依赖 task_001 和 task_002，顺序分析）。
+            第 4 批：task_005（依赖 task_003 和 task_004，最终写作）。
+            因 task_004 在 task_003 之后执行，它的 context 还包含 task_003 的结果。
+        """
+        # 1. 检查计划是否有任务，并建立任务类型到执行方法的映射。
         tasks = plan.get("tasks", [])
         if not tasks:
             raise ValueError("Research plan contains no tasks")
         handlers = {
             "deep_research": self._execute_deep_research_task,
             "deep_researcher": self._execute_deep_research_task,
-            "browser": self._execute_browser_task, "browser_use": self._execute_browser_task,
-            "deep_analyze": self._execute_analysis_task, "final_answer": self._execute_final_task
+            "browser": self._execute_browser_task,
+            "browser_use": self._execute_browser_task,
+            "deep_analyze": self._execute_analysis_task,
+            "final_answer": self._execute_final_task,
         }
+
+        # 2. 校验任务字段，并用 task_id 索引待处理任务；字典保留计划的插入顺序。
         pending = {}
         for task in tasks:
             task_id = task.get("task_id")
@@ -509,35 +546,65 @@ Use concise search queries in parameters.query for research or browser tasks wit
             if not isinstance(task.get("dependencies", []), list):
                 raise ValueError(f"Invalid dependencies for {task_id}")
             pending[task_id] = task
+
+        # 完成全部 ID 建档后再检查依赖，允许依赖列表中位置靠后的任务。
         for task in tasks:
             if any(dep not in pending for dep in task.get("dependencies", [])):
                 raise ValueError(f"Unknown dependency for {task['task_id']}")
+
+        # 3. 初始化任务结果字典：键为任务 ID，值为成功、失败或因依赖失败而跳过的结果。
         task_results = {}
         while pending:
-            ready = [task for task in pending.values()
-                     if all(dep in task_results for dep in task.get("dependencies", []))]
+            # 找出无需再等待依赖的任务：没有依赖，或所有依赖都已记录结果。
+            # 此处只检查依赖是否有结果，是否成功由下面的 failed 检查决定。
+            # 无依赖时 all([]) 为 True，因此可直接进入 ready。
+            ready = [
+                task
+                for task in pending.values()
+                if all(dep in task_results for dep in task.get("dependencies", []))
+            ]
             if not ready:
+                # 依赖存在性已校验；仍有任务却无法继续，说明剩余依赖中存在环。
                 raise ValueError("Research plan contains a dependency cycle")
+
+            # ready 是本轮快照；本轮完成后新解锁的任务将在下一轮进入 ready。
             for task in ready:
                 task_id = task["task_id"]
                 dependencies = task.get("dependencies", [])
-                failed = [dep for dep in dependencies if not task_results[dep].get("success")]
+                failed = [
+                    dep for dep in dependencies if not task_results[dep].get("success")
+                ]
                 if failed:
-                    task_results[task_id] = {"success": False, "error": f"Failed dependencies: {failed}",
-                                             "task_type": task["task_type"]}
+                    # 失败沿依赖链传播：不执行当前任务，但保留结果供下游继续判断。
+                    task_results[task_id] = {
+                        "success": False,
+                        "error": f"Failed dependencies: {failed}",
+                        "task_type": task["task_type"],
+                    }
                 else:
                     prepared = dict(task)
-                    # Include completed evidence as well as explicitly declared dependencies.
+                    # 纳入全部已成功结果，使后续分析和最终写作可复用已收集的证据。
+                    # 这里在每次调用前构建，因此也包含同一批中先完成任务的结果。
                     prepared["context"] = {
                         "research_topic": plan.get("research_topic", ""),
                         "requirements": plan.get("requirements", []),
-                        "task_results": {key: value for key, value in task_results.items() if value.get("success")}
+                        "task_results": {
+                            key: value
+                            for key, value in task_results.items()
+                            if value.get("success")
+                        },
                     }
                     try:
+                        # 按类型选取 handler，并等待当前任务结束后再处理下一个。
                         task_results[task_id] = await handlers[task["task_type"]](prepared)
                     except Exception as exc:
+                        # 单个任务异常不终止调度循环，后续依赖任务会被标记为阻断。
                         task_results[task_id] = {"success": False, "error": str(exc)}
+
+                # 无论成功、失败还是依赖阻断，本任务均已处理，移出待执行集合。
                 del pending[task_id]
+
+        # 返回完整任务结果，由上层决定是否满足生成报告的条件。
         return task_results
 
     @staticmethod
