@@ -118,19 +118,96 @@ class DeepReportApp:
         except Exception as exc:
             return {"success": False, "error": str(exc)}
 
-    async def _generate_report(self,
-                            research_topic: str,
-                            requirements: str,
-                            output_format: str = "html",
-                            model: str = "gpt-4o") -> Dict[str, Any]:
-        """Generate a comprehensive financial report"""
+    async def _generate_report(
+        self,
+        research_topic: str,
+        requirements: str,
+        output_format: str = "html",
+        model: str = "gpt-4o",
+    ) -> Dict[str, Any]:
+        """规划并执行研究任务，汇总结果后返回报告或结构化数据。
+
+        Args:
+            research_topic: 本次报告的研究主题。
+                真实示例："2026 中国经济展望及是否看好"。
+            requirements: 用户要求，多条要求用换行分隔，空行会被忽略。
+                真实示例："洞察力、客观"；解析后为 ["洞察力、客观"]。
+            output_format: 输出格式；"html" 会渲染并保存报告，其他值返回数据。
+                真实示例："html"，对应下方成功示例中的 HTML 报告。
+            model: 写入报告元数据的模型标识。实际模型实例由外层
+                generate_report() 初始化，本方法使用 self.model。
+                真实示例："gpt-4o"。
+
+        Returns:
+            包含 success 标志的结果字典：
+            - HTML 成功：report_path、report_html、report_data、generation_time。
+            - 非 HTML 成功：report_data、generation_time。
+            - 失败：error；计划执行不完整时另含 failed_tasks 和 task_results。
+
+        Examples:
+            与下方成功记录对应的调用参数（通过外层入口初始化请求级模型）::
+
+                result = await app.generate_report(
+                    research_topic="2026 中国经济展望及是否看好",
+                    requirements="洞察力、客观",
+                    output_format="html",
+                    model="gpt-4o",
+                )
+
+            以下摘自真实运行记录；使用 Python 字典形式展示，True/False 为
+            布尔值。省略号（...）仅代表未展开的内容，不是实际返回值。
+
+            HTML 生成成功（reports/runs/20261102_205851_d66c0992/009_result.json）::
+
+                {
+                    "success": True,
+                    "report_path": "./reports/financial_report_20261102_205952.html",
+                    "report_html": ...,  # 实际为完整 HTML 字符串。
+                    "report_data": {
+                        "research_topic": "2026 中国经济展望及是否看好",
+                        "model": "gpt-4o",
+                        "generated_at": "2026-11-02T20:59:52.583547",
+                        # 其余真实字段（plan、task_results、sections 等）省略。
+                    },
+                    "generation_time": "2026-11-02T20:59:52.586897",
+                }
+
+            研究任务失败（reports/runs/20261102_173405_da984c55/016_result.json）::
+
+                {
+                    "success": False,
+                    "error": "Research plan incomplete",
+                    "failed_tasks": {
+                        "task_003": (
+                            "Research content failed validation after two attempts: "
+                            "Evidence ID is not in the supplied source passages; "
+                            "select an ID from sources"
+                        ),
+                        "task_005": "Failed dependencies: ['task_003']",
+                    },
+                    "task_results": ...,  # 实际包含所有已执行或被阻断任务的结果。
+                }
+
+            上例中 task_003 的证据引用校验失败，依赖它的 task_005 因此被阻断。
+            运行记录另有 trace_path，由外层 generate_report() 添加，
+            不属于本方法直接返回的字段，因此以上示例未列出。
+
+        Notes:
+            研究任务全部成功后才组装报告。解析、执行或渲染中的异常在此
+            转为失败结果；运行记录的创建与最终结果记录由外层方法负责。
+        """
         try:
-            # Parse requirements
-            requirements_list = [req.strip() for req in requirements.split('\n') if req.strip()]
-            
+            # 1. 清理逐行输入，保留非空要求，供计划生成和后续任务共同使用。
+            requirements_list = [
+                req.strip()
+                for req in requirements.split("\n")
+                if req.strip()
+            ]
+
             logger.info(f"Starting report generation for topic: {research_topic}")
-            
-            # Step 1: Create research plan - directly call model.generate() to skip useless tool loop
+
+            # 2. 直接向模型请求结构化计划；此阶段不进入 PlanningAgent 的工具循环。
+            # 提示中明确任务依赖、URL 来源和浏览器动作格式，供执行器使用。
             planning_prompt = f"""You are an expert financial research planner. Create a comprehensive research plan as a JSON object.
 
 Research Topic: {research_topic}
@@ -174,32 +251,53 @@ exact_target must be a JSON boolean and requires a user-supplied url or pdf_path
 Use concise search queries in parameters.query for research or browser tasks without a URL."""
 
             messages = [ChatMessage(role="user", content=planning_prompt)]
+            # model.generate 是同步调用，放入线程执行，避免阻塞异步事件循环。
             response = await asyncio.to_thread(self.model.generate, messages)
-            response_text = response.content if hasattr(response, 'content') else str(response)
-            
-            # 剥离 markdown 代码块包裹，直接解析 JSON
+            response_text = (
+                response.content if hasattr(response, "content") else str(response)
+            )
+
+            # 兼容模型返回的 Markdown 代码围栏，再将正文解析为 JSON。
             plan_text = response_text.strip()
             if plan_text.startswith("```"):
-                plan_text = "\n".join(l for l in plan_text.split("\n")[1:] if not l.strip().startswith("```"))
-            
-            if getattr(self, 'trace', None):
-                self.trace.record('planning', {'topic': research_topic, 'response': response_text})
+                plan_text = "\n".join(
+                    l
+                    for l in plan_text.split("\n")[1:]
+                    if not l.strip().startswith("```")
+                )
+
+            # 在 JSON 解析前保存原始规划响应，解析失败时也有依据可追查。
+            if getattr(self, "trace", None):
+                self.trace.record(
+                    "planning",
+                    {"topic": research_topic, "response": response_text},
+                )
             plan_dict = json.loads(plan_text)
             if "tasks" not in plan_dict or not isinstance(plan_dict["tasks"], list):
-                return {"success": False, "error": "Invalid plan format: missing tasks list"}
+                return {
+                    "success": False,
+                    "error": "Invalid plan format: missing tasks list",
+                }
 
-            # Step 2: Execute research tasks
+            # 3. 向计划补充主题与要求，再由执行器校验依赖并逐项执行就绪任务。
             plan_dict["research_topic"] = research_topic
             plan_dict["requirements"] = requirements_list
             task_results = await self._execute_research_plan(plan_dict)
-            failed = {key: value.get("error", "Task failed") for key, value in task_results.items()
-                      if not value.get("success")}
+            # 汇总失败任务；不将缺少必要研究结果的运行发布为成功报告。
+            failed = {
+                key: value.get("error", "Task failed")
+                for key, value in task_results.items()
+                if not value.get("success")
+            }
             if failed or not task_results:
-                return {"success": False, "error": "Research plan incomplete",
-                        "failed_tasks": failed, "task_results": task_results}
+                return {
+                    "success": False,
+                    "error": "Research plan incomplete",
+                    "failed_tasks": failed,
+                    "task_results": task_results,
+                }
 
-
-            # Step 3: Generate final report
+            # 4. 从成功任务中提取展示所需数据；此处组装报告，不再调用模型写作。
             report_data = {
                 "title": f"Financial Research Report: {research_topic}",
                 "subtitle": "Comprehensive Analysis and Insights",
@@ -209,8 +307,15 @@ Use concise search queries in parameters.query for research or browser tasks wit
                 "task_results": task_results,
                 "generated_at": datetime.now().isoformat(),
                 "model": model,
+                # 保留现有固定值；这不是本次运行计算出的置信度。
                 "confidence_score": 85,
-                "data_points": sum(len(r.get("data", [])) for r in task_results.values() if isinstance(r, dict)),
+                # 沿用现有统计口径：对各结果 data 的 len 求和。
+                # data 为字典时统计的是字段数，不代表实际经济观测数量。
+                "data_points": sum(
+                    len(r.get("data", []))
+                    for r in task_results.values()
+                    if isinstance(r, dict)
+                ),
                 "charts_data": self._extract_chart_data(task_results),
                 "citations": self._extract_citations(task_results),
                 "data_sources": self._extract_data_sources(task_results),
@@ -218,44 +323,55 @@ Use concise search queries in parameters.query for research or browser tasks wit
                 "key_metrics": self._extract_key_metrics(task_results),
                 "risk_assessment": self._extract_risk_assessment(task_results),
                 "recommendations": self._extract_recommendations(task_results),
-                "executive_summary": self._generate_executive_summary(plan_dict, task_results)
+                "executive_summary": self._generate_executive_summary(
+                    plan_dict, task_results
+                ),
             }
-            
-            # Step 4: Generate HTML report
+
+            # 5. HTML 分支先渲染，再保存文件；非 HTML 分支只返回结构化数据。
             if output_format == "html":
                 html_result = await self.report_generator.generate_report(report_data)
-                
+
                 if html_result["success"]:
-                    # Save report to file
+                    # 用时间戳命名，写入配置的报告输出目录。
                     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     filename = f"financial_report_{timestamp}.html"
                     filepath = os.path.join(config.output_dir, filename)
-                    
-                    success = await self.report_generator.save_report(report_data, filepath)
-                    
+
+                    # save_report 内部会再次渲染；保持现有保存行为。
+                    success = await self.report_generator.save_report(
+                        report_data, filepath
+                    )
+
                     if success:
                         return {
                             "success": True,
                             "report_path": filepath,
                             "report_html": html_result["html_content"],
                             "report_data": report_data,
-                            "generation_time": datetime.now().isoformat()
+                            "generation_time": datetime.now().isoformat(),
                         }
                     else:
                         return {"success": False, "error": "Failed to save report"}
                 else:
-                    return {"success": False, "error": html_result.get("error", "Failed to generate HTML")}
-            
+                    return {
+                        "success": False,
+                        "error": html_result.get("error", "Failed to generate HTML"),
+                    }
+
+            # JSON 等非 HTML 格式由界面层序列化展示，本分支不单独写文件。
             return {
                 "success": True,
                 "report_data": report_data,
-                "generation_time": datetime.now().isoformat()
+                "generation_time": datetime.now().isoformat(),
             }
-            
+
         except Exception as e:
+            # 将未预期异常统一转为失败结果，供外层记录并由界面展示。
             logger.error(f"Report generation failed: {e}")
             return {"success": False, "error": str(e)}
-    
+
+
     async def _execute_research_plan(self, plan: Dict[str, Any]) -> Dict[str, Any]:
         """Execute research tasks from the plan"""
         tasks = plan.get("tasks", [])
@@ -725,19 +841,49 @@ Use concise search queries in parameters.query for research or browser tasks wit
 app = DeepReportApp()
 
 async def generate_report_interface(research_topic, requirements, output_format, model):
+    """处理 Gradio 的报告生成请求，并将结果转换为界面组件更新。
+
+    Args:
+        research_topic (str): 用户输入的研究主题。
+        requirements (str): 研究要求，多条要求用换行分隔。
+        output_format (str): 输出格式；界面提供 "html" 和 "json"。
+        model (str): 用于本次报告生成的模型标识。
+
+    Returns:
+        tuple: 按按钮事件 outputs 的顺序返回三个值：
+            HTML 展示组件的更新、状态文本、JSON/错误文本组件的更新。
+            每个分支都会清空并隐藏不使用的展示组件，避免残留上次结果。
+
+    Notes:
+        生成失败时优先展示失败任务详情；未预期异常转为错误文本，
+        不继续向 Gradio 事件处理层抛出。
+    """
     try:
+        # 等待后端完成生成；本函数只负责将结果映射到界面。
         result = await app.generate_report(research_topic, requirements, output_format, model)
         if not result.get("success"):
+            # 优先展示各失败任务的原因，没有任务详情时回退到整体错误。
             detail = result.get("failed_tasks") or result.get("error", "Unknown error")
             return gr.update(value="", visible=False), "Report generation failed", gr.update(
                 value=json.dumps(detail, ensure_ascii=False, indent=2), visible=True)
         if output_format == "html":
-            return gr.update(value=result["report_html"], visible=True), (
+            # 完整报告在 iframe 内加载，独立执行图表/标签脚本并隔离报告 CSS。
+            # srcdoc 按属性值转义；不授予同源权限，避免报告访问外层界面。
+            report_preview = (
+                '<iframe title="HTML 报告预览" '
+                'sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox allow-downloads" '
+                'style="display:block;width:100%;height:85vh;min-height:600px;'
+                'border:1px solid #e3e8f0;border-radius:12px;background:white;" '
+                f'srcdoc="{escape(result["report_html"], quote=True)}"></iframe>'
+            )
+            return gr.update(value=report_preview, visible=True), (
                 f"Report generated successfully! File saved to: {result.get('report_path', '')}"
             ), gr.update(value="", visible=False)
+        # 非 HTML 结果按 JSON 展示；保留中文字符并缩进，方便阅读。
         return gr.update(value="", visible=False), "Report data generated successfully!", gr.update(
             value=json.dumps(result["report_data"], ensure_ascii=False, indent=2), visible=True)
     except Exception as exc:
+        # 兜底处理调用、结果字段读取或序列化等异常，仍返回完整的界面更新。
         return gr.update(value="", visible=False), "Report generation failed", gr.update(value=str(exc), visible=True)
 
 
@@ -814,7 +960,7 @@ def create_gradio_interface():
                 label="Report Output",
                 interactive=False,
                 lines=20,
-                visible=True
+                visible=False
             )
         
         # Event handlers
