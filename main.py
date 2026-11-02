@@ -145,7 +145,8 @@ class DeepReportApp:
             - 失败：error；计划执行不完整时另含 failed_tasks 和 task_results。
 
         Examples:
-            与下方成功记录对应的调用参数（通过外层入口初始化请求级模型）::
+            最新真实运行：reports/runs/20261103_004034_9b3003eb/009_result.json。
+            以下展示对应调用参数及返回值，省略号仅用于展示长内容::
 
                 result = await app.generate_report(
                     research_topic="2026 中国经济展望及是否看好",
@@ -154,43 +155,23 @@ class DeepReportApp:
                     model="gpt-4o",
                 )
 
-            以下摘自真实运行记录；使用 Python 字典形式展示，True/False 为
-            布尔值。省略号（...）仅代表未展开的内容，不是实际返回值。
-
-            HTML 生成成功（reports/runs/20261102_205851_d66c0992/009_result.json）::
-
                 {
                     "success": True,
-                    "report_path": "./reports/financial_report_20261102_205952.html",
-                    "report_html": ...,  # 实际为完整 HTML 字符串。
+                    "report_path": "./reports/financial_report_20261103_004148.html",
+                    "report_html": ...,  # 完整 HTML 字符串，未在此展开。
                     "report_data": {
                         "research_topic": "2026 中国经济展望及是否看好",
+                        "requirements": ["洞察力、客观"],
                         "model": "gpt-4o",
-                        "generated_at": "2026-11-02T20:59:52.583547",
-                        # 其余真实字段（plan、task_results、sections 等）省略。
+                        "generated_at": "2026-11-03T00:41:48.053952",
+                        # plan、task_results、sections 等其他字段未展开。
                     },
-                    "generation_time": "2026-11-02T20:59:52.586897",
+                    "generation_time": "2026-11-03T00:41:48.056633",
                 }
 
-            研究任务失败（reports/runs/20261102_173405_da984c55/016_result.json）::
-
-                {
-                    "success": False,
-                    "error": "Research plan incomplete",
-                    "failed_tasks": {
-                        "task_003": (
-                            "Research content failed validation after two attempts: "
-                            "Evidence ID is not in the supplied source passages; "
-                            "select an ID from sources"
-                        ),
-                        "task_005": "Failed dependencies: ['task_003']",
-                    },
-                    "task_results": ...,  # 实际包含所有已执行或被阻断任务的结果。
-                }
-
-            上例中 task_003 的证据引用校验失败，依赖它的 task_005 因此被阻断。
-            运行记录另有 trace_path，由外层 generate_report() 添加，
-            不属于本方法直接返回的字段，因此以上示例未列出。
+            本次五个任务全部成功，没有 failed_tasks；任务概览见下方行内注释。
+            运行记录的 trace_path 由外层 generate_report() 添加，
+            不属于本方法直接返回的字段，因此以上返回示例未列出。
 
         Notes:
             研究任务全部成功后才组装报告。解析、执行或渲染中的异常在此
@@ -257,6 +238,95 @@ Use concise search queries in parameters.query for research or browser tasks wit
                 response.content if hasattr(response, "content") else str(response)
             )
 
+            # response_text 最新真实响应的中文译文（保留所有任务和字段）：
+            # 来源：reports/runs/20261103_004034_9b3003eb/001_planning.json。
+            # 英文说明与查询词译为中文；程序字段、任务类型和搜索运算符保持原样。
+            # 这是注释中的译文，实际 response_text 仍为模型返回的原始 str。
+            # data_sources / citations_required 是模型规划的来源，并非已采集或核实的引用。
+            # ```json
+            # {
+            #     "overview": "本研究考察中国2026年的经济展望，侧重以可信数据支持的客观分析，并深入探讨潜在的经济情景。",
+            #     "tasks": [
+            #         {
+            #             "task_id": "task_001",
+            #             "task_type": "deep_researcher",
+            #             "description": "开展初步文献综述，收集中国经济和近期政策进展的关键数据。",
+            #             "parameters": {
+            #                 "query": "2026年中国经济预测与政策展望"
+            #             },
+            #             "dependencies": [],
+            #             "priority": 1,
+            #             "estimated_duration": 30
+            #         },
+            #         {
+            #             "task_id": "task_002",
+            #             "task_type": "browser_use",
+            #             "description": "从中国政府和金融机构的官方来源中识别并提取相关报告或数据。",
+            #             "parameters": {
+            #                 "browser_task_type": "structured_data_extraction",
+            #                 "query": "site:gov.cn or site:pboc.gov.cn 2026年经济预测",
+            #                 "exact_target": false
+            #             },
+            #             "dependencies": [
+            #                 "task_001"
+            #             ],
+            #             "priority": 2,
+            #             "estimated_duration": 45
+            #         },
+            #         {
+            #             "task_id": "task_003",
+            #             "task_type": "deep_analyze",
+            #             "description": "分析收集到的数据与趋势，识别中国2026年经济的增长动力、风险和不确定性。",
+            #             "parameters": {},
+            #             "dependencies": [
+            #                 "task_001",
+            #                 "task_002"
+            #             ],
+            #             "priority": 3,
+            #             "estimated_duration": 60
+            #         },
+            #         {
+            #             "task_id": "task_004",
+            #             "task_type": "deep_analyze",
+            #             "description": "评估影响中国经济的全球和国内因素，包括全球市场动态、结构性改革和人口变化。",
+            #             "parameters": {},
+            #             "dependencies": [
+            #                 "task_001",
+            #                 "task_002"
+            #             ],
+            #             "priority": 3,
+            #             "estimated_duration": 50
+            #         },
+            #         {
+            #             "task_id": "task_005",
+            #             "task_type": "final_answer",
+            #             "description": "将研究发现综合成一份全面报告，回答研究问题：中国2026年的经济展望是否乐观，为什么？",
+            #             "parameters": {},
+            #             "dependencies": [
+            #                 "task_003",
+            #                 "task_004"
+            #             ],
+            #             "priority": 4,
+            #             "estimated_duration": 40
+            #         }
+            #     ],
+            #     "expected_output": "一份结构化报告，包含中国2026年经济展望的关键洞察、主要增长动力、风险、机遇，以及基于证据判断其前景是否乐观的结论。",
+            #     "data_sources": [
+            #         "世界银行",
+            #         "国际货币基金组织（IMF）",
+            #         "中国政府报告",
+            #         "经过同行评审的经济学期刊"
+            #     ],
+            #     "citations_required": [
+            #         "IMF 2022年中国经济报告",
+            #         "中国人民银行货币政策更新",
+            #         "世界银行中国区域预测"
+            #     ],
+            #     "estimated_duration": 225
+            # }
+            # ```
+            # 后续去掉代码围栏，再用 json.loads() 转为计划字典。
+
             # 兼容模型返回的 Markdown 代码围栏，再将正文解析为 JSON。
             plan_text = response_text.strip()
             if plan_text.startswith("```"):
@@ -283,6 +353,50 @@ Use concise search queries in parameters.query for research or browser tasks wit
             plan_dict["research_topic"] = research_topic
             plan_dict["requirements"] = requirements_list
             task_results = await self._execute_research_plan(plan_dict)
+            # task_results 是 dict：键为 task_id，值为该任务的执行结果字典。
+            # 它不是最终报告正文，也不是模型直接返回的 JSON 计划。
+            # 执行器依次执行就绪任务，将 handler 的结果收集到此字典中。
+            # 常见字段：
+            #   success：任务是否成功；下游依赖检查和本段失败汇总均使用它。
+            #   task_type：结果类型，如 deep_research、browser、analysis、final。
+            #   data：成功任务的数据；检索/浏览器任务含来源及提取正文，
+            #         分析/最终任务含 research_document 和文本结果。
+            #   error：失败原因；被失败依赖阻断的任务也会有一条失败结果。
+            # 不同路径的字段并不完全相同，需使用 get() 或先判断 success。
+            #
+            # 最新真实 task_results（五个任务全部展示，data 只保留关键字段）：
+            # 来源：reports/runs/20261103_004034_9b3003eb/009_result.json 的 report_data.task_results。
+            # 英文说明/标题在此译为中文；长摘要保留开头和结尾，… 不是原始内容。
+            # {
+            #     "task_001": {
+            #         "success": True, "task_type": "deep_research",
+            #         "data": {"agent_response": "已收集 3 份相关研究来源", ...}
+            #     },
+            #     "task_002": {
+            #         "success": True, "task_type": "browser",
+            #         "data": {"results": [{"title": "中国经济展望：2026年9月 | BBVA研究部", ...}], ...}
+            #     },
+            #     "task_003": {
+            #         "success": True, "task_type": "analysis",
+            #         "data": {"research_document": {
+            #             "summary": "研究发现，到2026年，中国经济可能面临国内需求疲软、房地产行业压力和 … 负面影响，整体经济增长呈中低速，但稳定。", ...
+            #         }, ...}
+            #     },
+            #     "task_004": {
+            #         "success": True, "task_type": "analysis",
+            #         "data": {"research_document": {
+            #             "summary": "研究表明，2026年中国经济增长温和且稳定，主要由高技术产业投资和相关 … 问题以及政策效果的滞后性构成了重要风险。", ...
+            #         }, ...}
+            #     },
+            #     "task_005": {
+            #         "success": True, "task_type": "final",
+            #         "data": {"research_document": {
+            #             "summary": "研究表明，到2026年，中国经济预计将保持温和增长，但面临多重挑战。其 … 问题需进一步解决，以实现就业潜力的释放。", ...
+            #         }, ...}
+            #     },
+            # }
+            # task_001 检索、task_002 浏览器读取、task_003/004 分析、task_005 最终写作均成功。
+            # 本次 failed = {}，且 task_results 非空，因此继续组装并生成 HTML 报告。
             # 汇总失败任务；不将缺少必要研究结果的运行发布为成功报告。
             failed = {
                 key: value.get("error", "Task failed")
