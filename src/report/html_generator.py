@@ -25,7 +25,7 @@ class HTMLReportGenerator:
         """Load HTML report template"""
         template_content = """
 <!DOCTYPE html>
-<html lang="en">
+<html lang="{{ 'zh-CN' if chinese else 'en' }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -114,6 +114,87 @@ class HTMLReportGenerator:
             padding: 2rem 0;
             margin-top: 3rem;
         }
+        /* Report reading layout */
+        * { box-sizing: border-box; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; color: #253247; background: #f3f5f9; line-height: 1.8; overflow-wrap: anywhere; }
+        .container { max-width: 1160px; margin: 0 auto; padding-left: 24px; padding-right: 24px; }
+        .header { background: #253b60; padding: 48px 0; }
+        .header h1 { font-size: clamp(26px, 3.2vw, 40px); font-weight: 650; line-height: 1.35; }
+        .header .lead { opacity: .8; font-size: 16px; margin-top: 16px; }
+        .section { padding: 32px; border: 1px solid #e3e8f0; border-radius: 16px; box-shadow: 0 4px 16px #24355004; }
+        .section > h2 { font-size: 22px; font-weight: 650; margin-bottom: 24px; }
+        .metric-card { background: #edf2fb; color: #294773; border: 1px solid #dbe4f3; }
+        .header .metric-card { background: #ffffff10; border-color: #ffffff30; color: white; }
+        .metric-card h5, .metric-card h4 { font-size: 15px; }
+        .executive-summary { background: #eaf0fa; border-color: #5976ae; border-radius: 8px; padding: 24px 28px; }
+        .executive-summary h3 { font-size: 20px; }
+        .chart-container { height: 300px; margin: 24px 0; }
+        .nav-tabs { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 0 12px; border-bottom: 1px solid #e1e7ef; list-style: none; }
+        .nav-tabs .nav-link { border: 0; border-radius: 8px; padding: 10px 16px; color: #5d6c83; background: transparent; font-size: 15px; line-height: 1.5; }
+        .nav-tabs .nav-link:hover { background: #f1f4fa; color: #294773; }
+        .nav-tabs .nav-link.active { background: #e8eefb; color: #294d8b; font-weight: 650; }
+        .nav-link:focus-visible, summary:focus-visible, a:focus-visible { outline: 2px solid #4266a5; outline-offset: 3px; }
+        .tab-content > .tab-pane { display: none; }
+        .tab-content > .active { display: block; }
+        #analysisTabsContent { padding-top: 18px; }
+        .reading-column { max-width: 820px; margin: 0 auto; }
+        .section-intro { color: #66748a; font-size: 14px; margin-bottom: 24px; }
+        .method-steps { padding-left: 28px; }
+        .method-steps li { padding: 0 0 20px 14px; }
+        .method-steps li::marker { color: #5976ae; font-weight: 650; }
+        .method-steps h3 { font-size: 18px; margin-bottom: 8px; }
+        .method-steps p { color: #66748a; margin: 0; }
+        .source-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
+        .source-stack { display: grid; gap: 20px; }
+        .source-card { border: 1px solid #dfe6ef; border-radius: 12px; padding: 24px; background: #fff; min-width: 0; }
+        .source-card h3 { font-size: 17px; line-height: 1.55; margin: 8px 0 14px; font-weight: 650; }
+        .source-card p { font-size: 14px; color: #59667a; }
+        .source-meta { color: #77859b; font-size: 12px; letter-spacing: .04em; margin-bottom: 8px; }
+        .source-link { display: inline-block; font-size: 13px; color: #365f9d; text-decoration: none; border-bottom: 1px solid #cbd7e9; }
+        .source-link:hover { color: #173d75; border-color: #173d75; }
+        .source-preview { margin-top: 18px; }
+        .source-details { border-top: 1px solid #e6ebf2; margin-top: 16px; padding-top: 12px; }
+        .source-details summary { cursor: pointer; color: #365f9d; font-size: 14px; }
+        .source-details[open] summary { margin-bottom: 16px; }
+        .research-document + .research-document { border-top: 2px solid #e1e7ef; padding-top: 32px; margin-top: 40px; }
+        .task-scope { margin-bottom: 20px; color: #66748a; font-size: 13px; }
+        .task-scope summary { cursor: pointer; }
+        .task-scope[open] summary { margin-bottom: 12px; }
+        #analysisTabsContent .tab-pane { transition: none; }
+        .task-heading { font-size: 19px; line-height: 1.6; margin-bottom: 20px; }
+        .research-summary { padding: 20px 24px; background: #f0f4fb; border-left: 3px solid #6986bc; border-radius: 0 10px 10px 0; }
+        .research-summary p:last-child { margin-bottom: 0; }
+        .research-document p { font-size: 16px; line-height: 1.95; margin-bottom: 16px; }
+        .research-subsection { padding-top: 30px; }
+        .research-subsection h4 { font-size: 19px; font-weight: 650; line-height: 1.6; margin: 0 0 14px; display: flex; gap: 12px; }
+        .section-number { font-size: 13px; color: #7f94b6; padding-top: 5px; flex-shrink: 0; }
+        .evidence-links { display: flex; gap: 8px 14px; flex-wrap: wrap; align-items: baseline; padding-bottom: 20px; border-bottom: 1px solid #e8ecf2; }
+        .evidence-links > span { font-size: 12px; color: #8b96a7; }
+        .research-limitations { background: #faf8f2; border: 1px solid #eae4d5; border-radius: 10px; padding: 20px 24px; margin-top: 28px; }
+        .research-limitations h4 { font-size: 16px; margin-bottom: 12px; }
+        .research-limitations ul { padding-left: 20px; margin-bottom: 0; font-size: 14px; color: #726b5c; }
+        .research-limitations li + li { margin-top: 8px; }
+        .citation { padding: 16px 20px; background: #f8fafc; border-color: #ccd7e9; border-radius: 0 8px 8px 0; overflow-wrap: anywhere; }
+        .recommendation { border-radius: 0 8px 8px 0; }
+        .footer { background: #253b60; font-size: 13px; }
+        @media (max-width: 600px) {
+            .container { padding-left: 14px; padding-right: 14px; }
+            .header { padding: 28px 0; }
+            .section { padding: 20px 16px; margin-bottom: 18px; }
+            .source-grid { grid-template-columns: 1fr; }
+            .source-card { padding: 18px; }
+            .nav-tabs { gap: 4px; }
+            .nav-tabs .nav-link { padding: 9px 10px; font-size: 14px; }
+            .research-summary, .research-limitations { padding: 16px; }
+            .research-document p { font-size: 15px; }
+            .research-subsection h4 { font-size: 17px; }
+            .chart-container { height: 240px; }
+        }
+        @media print {
+            .tab-content > .tab-pane { display: block !important; opacity: 1 !important; break-before: auto; }
+            .nav-tabs, .footer { display: none; }
+            .section { box-shadow: none; padding: 16px; }
+        }
     </style>
 </head>
 <body>
@@ -130,9 +211,9 @@ class HTMLReportGenerator:
                 </div>
                 <div class="col-md-4 text-end">
                     <div class="metric-card">
-                        <h4>Confidence Score</h4>
-                        <h2>{{ confidence_score }}%</h2>
-                        <small>Based on {{ data_points }} data points</small>
+                        <h4>{{ '研究来源' if chinese else 'Research Sources' }}</h4>
+                        <h2>{{ data_points }}</h2>
+                        <small>{{ '已提取并采纳的来源数量' if chinese else 'Sources read and selected' }}</small>
                     </div>
                 </div>
             </div>
@@ -201,15 +282,16 @@ class HTMLReportGenerator:
         <!-- Analysis Sections -->
         {% if sections %}
         <div class="section">
-            <h2><i class="fas fa-analytics"></i> Analysis</h2>
+            <h2>{{ "研究报告" if chinese else "Research Report" }}</h2>
             
             <ul class="nav nav-tabs" id="analysisTabs" role="tablist">
                 {% for section in sections %}
                 <li class="nav-item" role="presentation">
                     <button class="nav-link {% if loop.first %}active{% endif %}" 
                             id="{{ section.id }}-tab" data-bs-toggle="tab" 
-                            data-bs-target="#{{ section.id }}" type="button" role="tab">
-                        {{ section.title }}
+                            data-bs-target="#{{ section.id }}" type="button" role="tab"
+                            aria-controls="{{ section.id }}" aria-selected="{{ 'true' if loop.first else 'false' }}">
+                        {{ {"methodology": "研究方法", "extracted_content": "提取的研究内容", "search_results": "搜索结果", "research_analysis": "分析", "final_report": "最终报告"}.get(section.id, section.title) if chinese else section.title }}
                     </button>
                 </li>
                 {% endfor %}
@@ -218,7 +300,7 @@ class HTMLReportGenerator:
             <div class="tab-content" id="analysisTabsContent">
                 {% for section in sections %}
                 <div class="tab-pane fade {% if loop.first %}show active{% endif %}" 
-                     id="{{ section.id }}" role="tabpanel">
+                     id="{{ section.id }}" role="tabpanel" aria-labelledby="{{ section.id }}-tab">
                     <div class="mt-3">
                         {{ section.content | safe }}
                     </div>
@@ -354,10 +436,26 @@ class HTMLReportGenerator:
         
         // Initialize charts when page loads
         document.addEventListener('DOMContentLoaded', function() {
+            // Keep tabs usable when the external Bootstrap script is unavailable.
+            if (typeof bootstrap === 'undefined') {
+                document.querySelectorAll('[data-bs-toggle="tab"]').forEach(button => {
+                    button.addEventListener('click', () => {
+                        const nav = button.closest('[role="tablist"]');
+                        nav.querySelectorAll('[role="tab"]').forEach(tab => {
+                            const active = tab === button;
+                            tab.classList.toggle('active', active);
+                            tab.setAttribute('aria-selected', String(active));
+                            const pane = document.querySelector(tab.dataset.bsTarget);
+                            pane.classList.toggle('active', active);
+                            pane.classList.toggle('show', active);
+                        });
+                    });
+                });
+            }
             // Initialize all charts
             Object.keys(chartConfigs).forEach(chartId => {
                 const ctx = document.getElementById(chartId + '-canvas');
-                if (ctx) {
+                if (ctx && typeof Chart !== "undefined") {
                     new Chart(ctx, chartConfigs[chartId]);
                 }
             });
@@ -389,7 +487,7 @@ class HTMLReportGenerator:
 </body>
 </html>
         """
-        return Template(template_content)
+        return Template(template_content, autoescape=True)
     
     async def generate_report(self, report_data: Dict[str, Any]) -> Dict[str, Any]:
         """Generate HTML report"""
@@ -419,11 +517,12 @@ class HTMLReportGenerator:
             
             # Prepare template data
             template_data = {
+                "chinese": any("\u4e00" <= c <= "\u9fff" for c in report_data.get("title", "")),
                 "title": report_data.get("title", "Financial Research Report"),
                 "subtitle": report_data.get("subtitle", "Comprehensive Analysis and Insights"),
                 "generated_date": datetime.now().strftime("%B %d, %Y at %I:%M %p"),
                 "author": report_data.get("author", "DeepReport AI"),
-                "confidence_score": report_data.get("confidence_score", 85),
+                "confidence_score": report_data.get("confidence_score"),
                 "data_points": report_data.get("data_points", 0),
                 "executive_summary": report_data.get("executive_summary", ""),
                 "key_metrics": report_data.get("key_metrics", []),

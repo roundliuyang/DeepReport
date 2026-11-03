@@ -160,3 +160,5 @@ Thumbs.db
 *.tmp
 *.temp
 *.backup
+.gradio/
+*.bkp

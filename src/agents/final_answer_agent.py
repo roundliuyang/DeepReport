@@ -8,7 +8,7 @@ import logging
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 from smolagents import Tool
-from smolagents.memory import ConversationMemory
+from smolagents.memory import AgentMemory
 from smolagents.models import OpenAIModel
 
 from .base_agent import BaseAgent, Task, TaskResult
@@ -19,38 +19,45 @@ class HTMLReportTool(Tool):
     """Tool for generating HTML reports"""
     
     def __init__(self):
-        super().__init__(
-            name="generate_html_report",
-            description="Generate comprehensive HTML financial reports",
-            parameters={
-                "report_data": {
-                    "type": "object",
-                    "description": "Report data and content"
-                },
-                "template_style": {
-                    "type": "string",
-                    "description": "Report template style",
-                    "enum": ["professional", "modern", "academic", "executive"],
-                    "default": "professional"
-                },
-                "include_charts": {
-                    "type": "boolean",
-                    "description": "Whether to include interactive charts",
-                    "default": True
-                },
-                "include_citations": {
-                    "type": "boolean",
-                    "description": "Whether to include citations and references",
-                    "default": True
-                }
+        super().__init__()
+        self.name = "generate_html_report"
+        self.description = "Generate comprehensive HTML financial reports"
+        self.inputs = {
+            "report_data": {
+                "type": "object",
+                "description": "Report data and content"
+            },
+            "template_style": {
+                "type": "string",
+                "description": "Report template style",
+                "nullable": True
+            },
+            "include_charts": {
+                "type": "boolean",
+                "description": "Whether to include interactive charts",
+                "nullable": True
+            },
+            "include_citations": {
+                "type": "boolean",
+                "description": "Whether to include citations and references",
+                "nullable": True
             }
-        )
+        }
+        self.output_type = "object"
+
+    def forward(self, report_data: Dict[str, Any], template_style: str = "professional", include_charts: bool = True, include_citations: bool = True) -> Dict[str, Any]:
+        """Generate HTML report (synchronous)"""
+        try:
+            return self._run_sync(report_data, template_style, include_charts, include_citations)
+        except Exception as e:
+            logger.error(f"HTML report generation failed: {e}")
+            return {"error": str(e)}
     
-    async def run(self, report_data: Dict[str, Any], template_style: str = "professional", include_charts: bool = True, include_citations: bool = True) -> Dict[str, Any]:
-        """Generate HTML report"""
+    def _run_sync(self, report_data: Dict[str, Any], template_style: str, include_charts: bool, include_citations: bool) -> Dict[str, Any]:
+        """Synchronous HTML report generation"""
         try:
             # Generate HTML content
-            html_content = await self._generate_html_content(report_data, template_style, include_charts, include_citations)
+            html_content = self._generate_html_content(report_data, template_style, include_charts, include_citations)
             
             return {
                 "format": "html",
@@ -65,7 +72,7 @@ class HTMLReportTool(Tool):
             logger.error(f"HTML report generation failed: {e}")
             return {"error": str(e)}
     
-    async def _generate_html_content(self, report_data: Dict[str, Any], template_style: str, include_charts: bool, include_citations: bool) -> str:
+    def _generate_html_content(self, report_data: Dict[str, Any], template_style: str, include_charts: bool, include_citations: bool) -> str:
         """Generate HTML content for the report"""
         try:
             title = report_data.get("title", "Financial Research Report")
@@ -417,23 +424,23 @@ class MarkdownReportTool(Tool):
     """Tool for generating Markdown reports"""
     
     def __init__(self):
-        super().__init__(
-            name="generate_markdown_report",
-            description="Generate comprehensive Markdown financial reports",
-            parameters={
-                "report_data": {
-                    "type": "object",
-                    "description": "Report data and content"
-                },
-                "include_toc": {
-                    "type": "boolean",
-                    "description": "Whether to include table of contents",
-                    "default": True
-                }
+        super().__init__()
+        self.name = "generate_markdown_report"
+        self.description = "Generate comprehensive Markdown financial reports"
+        self.inputs = {
+            "report_data": {
+                "type": "object",
+                "description": "Report data and content"
+            },
+            "include_toc": {
+                "type": "boolean",
+                "description": "Whether to include table of contents",
+                "nullable": True
             }
-        )
+        }
+        self.output_type = "object"
     
-    async def run(self, report_data: Dict[str, Any], include_toc: bool = True) -> Dict[str, Any]:
+    def forward(self, report_data: Dict[str, Any], include_toc: bool = True) -> Dict[str, Any]:
         """Generate Markdown report"""
         try:
             title = report_data.get("title", "Financial Research Report")
@@ -445,6 +452,10 @@ class MarkdownReportTool(Tool):
             markdown_content = f"# {title}\n\n"
             markdown_content += f"*Generated on {datetime.now().strftime('%B %d, %Y')}*\n\n"
             
+            # Generate markdown content
+            markdown_content = f"# {title}\n\n"
+            markdown_content += f"*Generated on {datetime.now().strftime('%B %d, %Y')}*\n\n"
+
             # Table of contents
             if include_toc:
                 markdown_content += "## Table of Contents\n\n"
@@ -497,25 +508,41 @@ class QualityAssessmentTool(Tool):
     """Tool for assessing report quality"""
     
     def __init__(self):
-        super().__init__(
-            name="assess_report_quality",
-            description="Assess the quality and completeness of reports",
-            parameters={
-                "report_data": {
-                    "type": "object",
-                    "description": "Report data to assess"
-                },
-                "quality_criteria": {
-                    "type": "array",
-                    "description": "Quality criteria to assess",
-                    "items": {"type": "string"},
-                    "default": ["completeness", "accuracy", "clarity", "structure", "citations"]
-                }
+        super().__init__()
+        self.name = "assess_report_quality"
+        self.description = "Assess the quality and completeness of reports"
+        self.inputs = {
+            "report_data": {
+                "type": "object",
+                "description": "Report data to assess"
+            },
+            "quality_criteria": {
+                "type": "array",
+                "description": "Quality criteria to assess",
+                "nullable": True
             }
-        )
+        }
+        self.output_type = "object"
     
-    async def run(self, report_data: Dict[str, Any], quality_criteria: List[str] = None) -> Dict[str, Any]:
+    def forward(self, report_data: Dict[str, Any], quality_criteria: List[str] = None) -> Dict[str, Any]:
         """Assess report quality"""
+        try:
+            if quality_criteria is None:
+                quality_criteria = ["completeness", "accuracy", "clarity", "structure", "citations"]
+
+            # Use asyncio to run async operations
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(self._run_async(report_data, quality_criteria))
+            finally:
+                loop.close()
+        except Exception as e:
+            logger.error(f"Quality assessment failed: {e}")
+            return {"error": str(e)}
+
+    async def _run_async(self, report_data: Dict[str, Any], quality_criteria: List[str]) -> Dict[str, Any]:
+        """Async helper for quality assessment"""
         try:
             if quality_criteria is None:
                 quality_criteria = ["completeness", "accuracy", "clarity", "structure", "citations"]
@@ -725,25 +752,41 @@ class DataVisualizationTool(Tool):
     """Tool for creating data visualizations"""
     
     def __init__(self):
-        super().__init__(
-            name="create_visualizations",
-            description="Create charts and data visualizations",
-            parameters={
-                "data": {
-                    "type": "object",
-                    "description": "Data to visualize"
-                },
-                "chart_types": {
-                    "type": "array",
-                    "description": "Types of charts to create",
-                    "items": {"type": "string", "enum": ["line", "bar", "pie", "scatter", "radar"]},
-                    "default": ["line", "bar"]
-                }
+        super().__init__()
+        self.name = "create_visualizations"
+        self.description = "Create charts and data visualizations"
+        self.inputs = {
+            "data": {
+                "type": "object",
+                "description": "Data to visualize"
+            },
+            "chart_types": {
+                "type": "array",
+                "description": "Types of charts to create",
+                "nullable": True
             }
-        )
+        }
+        self.output_type = "object"
     
-    async def run(self, data: Dict[str, Any], chart_types: List[str] = None) -> Dict[str, Any]:
+    def forward(self, data: Dict[str, Any], chart_types: List[str] = None) -> Dict[str, Any]:
         """Create data visualizations"""
+        try:
+            if chart_types is None:
+                chart_types = ["line", "bar"]
+
+            # Use asyncio to run async operations
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            try:
+                return loop.run_until_complete(self._run_async(data, chart_types))
+            finally:
+                loop.close()
+        except Exception as e:
+            logger.error(f"Data visualization failed: {e}")
+            return {"error": str(e)}
+
+    async def _run_async(self, data: Dict[str, Any], chart_types: List[str]) -> Dict[str, Any]:
+        """Async helper for data visualization"""
         try:
             if chart_types is None:
                 chart_types = ["line", "bar"]
@@ -815,242 +858,9 @@ class DataVisualizationTool(Tool):
             return None
 
 class FinalAnswerAgent(BaseAgent):
-    """Agent for generating final comprehensive reports using SmolAgents"""
-    
-    def __init__(self, model: OpenAIModel, memory: ConversationMemory = None):
-        super().__init__(
-            name="FinalAnswerAgent",
-            model=model,
-            memory=memory or ConversationMemory()
-        )
-        
-        # Add report generation tools
-        self.add_custom_tool(HTMLReportTool())
-        self.add_custom_tool(MarkdownReportTool())
-        self.add_custom_tool(QualityAssessmentTool())
-        self.add_custom_tool(DataVisualizationTool())
-    
-    async def execute_task(self, task: Task) -> TaskResult:
-        """Generate final answer/report using SmolAgents"""
-        start_time = datetime.now()
-        
-        try:
-            report_data = task.parameters.get("report_data")
-            output_format = task.parameters.get("output_format", "html")
-            requirements = task.parameters.get("requirements", [])
-            
-            if not report_data:
-                return TaskResult(
-                    task_id=task.id,
-                    success=False,
-                    error="Report data is required"
-                )
-            
-            # Create task description for SmolAgents
-            task_description = f"Generate comprehensive {output_format} report with data visualizations and quality assessment"
-            
-            # Use SmolAgents to orchestrate the report generation
-            result = await self.run_task_with_smolagents(task_description)
-            
-            if result.get("success"):
-                report_result = result.get("result", {})
-                
-                # Enhance with specific report generation
-                enhanced_result = await self._enhance_report_result(report_result, task)
-                
-                execution_time = (datetime.now() - start_time).total_seconds()
-                
-                return TaskResult(
-                    task_id=task.id,
-                    success=True,
-                    result=enhanced_result,
-                    execution_time=execution_time,
-                    metadata={
-                        "output_format": output_format,
-                        "report_sections": len(report_data.get("sections", [])),
-                        "requirements_met": len(requirements),
-                        "method": "smolagents"
-                    }
-                )
-            else:
-                # Fallback to traditional method
-                fallback_result = await self._execute_traditional_report_generation(task)
-                fallback_result.execution_time = (datetime.now() - start_time).total_seconds()
-                return fallback_result
-                
-        except Exception as e:
-            execution_time = (datetime.now() - start_time).total_seconds()
-            return TaskResult(
-                task_id=task.id,
-                success=False,
-                error=str(e),
-                execution_time=execution_time
-            )
-    
-    async def _enhance_report_result(self, smolagents_result: Dict[str, Any], task: Task) -> Dict[str, Any]:
-        """Enhance SmolAgents result with specific report generation"""
-        try:
-            output_format = task.parameters.get("output_format", "html")
-            report_data = task.parameters.get("report_data")
-            
-            if output_format == "html":
-                html_tool = HTMLReportTool()
-                html_result = await html_tool.run(
-                    report_data, 
-                    template_style="professional",
-                    include_charts=True,
-                    include_citations=True
-                )
-                smolagents_result.update(html_result)
-                
-                # Generate charts
-                if report_data.get("charts_data"):
-                    viz_tool = DataVisualizationTool()
-                    charts_result = await viz_tool.run(report_data["charts_data"])
-                    smolagents_result["charts"] = charts_result.get("charts", [])
-                
-                # Quality assessment
-                quality_tool = QualityAssessmentTool()
-                quality_result = await quality_tool.run(report_data)
-                smolagents_result["quality_assessment"] = quality_result
-                
-            elif output_format == "markdown":
-                markdown_tool = MarkdownReportTool()
-                markdown_result = await markdown_tool.run(report_data)
-                smolagents_result.update(markdown_result)
-            
-            elif output_format == "json":
-                smolagents_result.update(self._generate_json_report(report_data))
-            
-            # Add metadata
-            smolagents_result["enhanced_at"] = datetime.now().isoformat()
-            smolagents_result["enhanced_by"] = "FinalAnswerAgent"
-            
-            return smolagents_result
-            
-        except Exception as e:
-            logger.error(f"Failed to enhance report result: {e}")
-            return smolagents_result
-    
-    async def _execute_traditional_report_generation(self, task: Task) -> TaskResult:
-        """Fallback traditional report generation"""
-        try:
-            report_data = task.parameters.get("report_data")
-            output_format = task.parameters.get("output_format", "html")
-            requirements = task.parameters.get("requirements", [])
-            
-            if output_format == "html":
-                result = await self._generate_html_report(report_data, requirements)
-            elif output_format == "markdown":
-                result = await self._generate_markdown_report(report_data, requirements)
-            elif output_format == "json":
-                result = await self._generate_json_report(report_data)
-            else:
-                result = {"error": f"Unsupported output format: {output_format}"}
-            
-            return TaskResult(
-                task_id=task.id,
-                success="error" not in result,
-                result=result if "error" not in result else None,
-                error=result.get("error") if "error" in result else None,
-                metadata={
-                    "output_format": output_format,
-                    "report_sections": len(report_data.get("sections", [])),
-                    "requirements_met": len(requirements),
-                    "method": "traditional"
-                }
-            )
-            
-        except Exception as e:
-            return TaskResult(
-                task_id=task.id,
-                success=False,
-                error=str(e)
-            )
-    
-    async def _generate_html_report(self, report_data: Dict[str, Any], requirements: List[str]) -> Dict[str, Any]:
-        """Generate HTML report"""
-        try:
-            html_tool = HTMLReportTool()
-            return await html_tool.run(report_data)
-        except Exception as e:
-            return {"error": f"HTML report generation failed: {str(e)}"}
-    
-    async def _generate_markdown_report(self, report_data: Dict[str, Any], requirements: List[str]) -> Dict[str, Any]:
-        """Generate Markdown report"""
-        try:
-            markdown_tool = MarkdownReportTool()
-            return await markdown_tool.run(report_data)
-        except Exception as e:
-            return {"error": f"Markdown report generation failed: {str(e)}"}
-    
-    def _generate_json_report(self, report_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate JSON report"""
-        try:
-            structured_report = {
-                "metadata": {
-                    "title": report_data.get("title", "Financial Research Report"),
-                    "generated_at": datetime.now().isoformat(),
-                    "version": "1.0"
-                },
-                "executive_summary": report_data.get("executive_summary", ""),
-                "sections": report_data.get("sections", []),
-                "data": report_data.get("data", {}),
-                "charts": report_data.get("charts", []),
-                "citations": report_data.get("citations", []),
-                "conclusions": report_data.get("conclusions", ""),
-                "recommendations": report_data.get("recommendations", [])
-            }
-            
-            return {
-                "format": "json",
-                "content": structured_report,
-                "generated_at": datetime.now().isoformat()
-            }
-            
-        except Exception as e:
-            return {"error": f"JSON report generation failed: {str(e)}"}
-    
-    def get_capabilities(self) -> List[str]:
-        """Return list of capabilities this agent provides"""
-        return [
-            "report_generation",
-            "html_generation",
-            "markdown_generation",
-            "data_visualization",
-            "citation_formatting",
-            "quality_assessment",
-            "executive_summary",
-            "smolagents_integration"
-        ]
-    
-    async def generate_report_with_smolagents(self, report_data: Dict[str, Any], output_format: str = "html") -> Dict[str, Any]:
-        """Generate report using SmolAgents framework directly"""
-        try:
-            # Create comprehensive report generation task
-            task_description = f"""
-            Generate a comprehensive {output_format} financial report with the following features:
-            
-            1. Professional formatting and styling
-            2. Interactive data visualizations and charts
-            3. Proper sections and subsections
-            4. Citations and references
-            5. Executive summary
-            6. Data tables and analysis
-            7. Conclusions and recommendations
-            8. Quality assessment and review
-            
-            Output format: {output_format}
-            Report data: {json.dumps(report_data, indent=2)}
-            """
-            
-            result = await self.run_task_with_smolagents(task_description)
-            
-            if result.get("success"):
-                return result.get("result", {})
-            else:
-                raise Exception(f"SmolAgents report generation failed: {result.get('error')}")
-                
-        except Exception as e:
-            logger.error(f"SmolAgents report generation failed: {e}")
-            raise
+    def __init__(self, model, memory=None, tools=None):
+        super().__init__('FinalAnswerAgent', model, tools=tools, instructions=(
+            'Synthesize upstream analysis and source evidence into the actual report. '
+            'Inspect sources with tools as needed. Submit research JSON via final_answer. '
+            'Do not report rendering status or perform a self-rated quality assessment.'
+        ))

@@ -1,13 +1,14 @@
 import os
 from typing import Dict, Any, Optional
-from pydantic import BaseSettings, Field
+from pydantic_settings import BaseSettings
+from pydantic import Field
 
 class Config(BaseSettings):
     """Configuration for DeepReport system"""
     
     # API Keys
     openai_api_key: str = Field(..., env="OPENAI_API_KEY")
-    anthropic_api_key: str = Field(..., env="ANTHROPIC_API_KEY")
+    anthropic_api_key: Optional[str] = Field(None, env="ANTHROPIC_API_KEY")
     serper_api_key: Optional[str] = Field(None, env="SERPER_API_KEY")
     metaso_api_key: Optional[str] = Field(None, env="METASO_API_KEY")
     sogou_api_key: Optional[str] = Field(None, env="SOGOU_API_KEY")

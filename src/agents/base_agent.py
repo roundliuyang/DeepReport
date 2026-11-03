@@ -1,150 +1,116 @@
-from abc import ABC, abstractmethod
-from typing import Dict, Any, List, Optional, Callable
-from dataclasses import dataclass
-from enum import Enum
+"""基于 smolagents 的执行与校验入口。"""
 import asyncio
-import logging
-from smolagents import Agent, Tool
-from smolagents.memory import Memory
-from smolagents.models import Model
+import json
+import inspect
+import hashlib
+from dataclasses import dataclass, field
+from typing import Any, Dict, List
+from smolagents import ToolCallingAgent
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-class AgentStatus(Enum):
-    IDLE = "idle"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
 
 @dataclass
 class Task:
-    """Task data structure for agents"""
     id: str
     type: str
     description: str
     parameters: Dict[str, Any]
-    dependencies: List[str] = None
+    dependencies: List[str] = field(default_factory=list)
     priority: int = 1
     max_retries: int = 3
-    
-    def __post_init__(self):
-        if self.dependencies is None:
-            self.dependencies = []
+
 
 @dataclass
 class TaskResult:
-    """Result of task execution"""
     task_id: str
     success: bool
     result: Any = None
     error: str = None
-    execution_time: float = 0.0
-    metadata: Dict[str, Any] = None
-    
-    def __post_init__(self):
-        if self.metadata is None:
-            self.metadata = {}
 
-class BaseAgent(Agent, ABC):
-    """Base class for all agents in the system using SmolAgents framework"""
-    
-    def __init__(self, name: str, model: Model, memory: Memory = None, tools: List[Tool] = None):
-        super().__init__(name=name, model=model, memory=memory, tools=tools or [])
-        self.status = AgentStatus.IDLE
-        self.task_queue = asyncio.Queue()
-        self.completed_tasks = {}
-        self.failed_tasks = {}
-        self.model_config = model.config if hasattr(model, 'config') else {}
-        
-    @abstractmethod
-    async def execute_task(self, task: Task) -> TaskResult:
-        """Execute a single task"""
-        pass
-    
-    @abstractmethod
-    def get_capabilities(self) -> List[str]:
-        """Return list of capabilities this agent provides"""
-        pass
-    
-    async def start(self):
-        """Start the agent"""
-        self.status = AgentStatus.RUNNING
-        logger.info(f"Agent {self.name} started")
-        
-    async def stop(self):
-        """Stop the agent"""
-        self.status = AgentStatus.IDLE
-        logger.info(f"Agent {self.name} stopped")
-    
-    async def submit_task(self, task: Task) -> str:
-        """Submit a task for execution"""
-        await self.task_queue.put(task)
-        logger.info(f"Task {task.id} submitted to {self.name}")
-        return task.id
-    
-    async def get_task_result(self, task_id: str) -> Optional[TaskResult]:
-        """Get result of a completed task"""
-        return self.completed_tasks.get(task_id)
-    
-    async def wait_for_task(self, task_id: str, timeout: float = 300.0) -> Optional[TaskResult]:
-        """Wait for a task to complete"""
-        start_time = asyncio.get_event_loop().time()
-        
-        while asyncio.get_event_loop().time() - start_time < timeout:
-            result = await self.get_task_result(task_id)
-            if result:
-                return result
-            await asyncio.sleep(1)
-        
-        return None
-    
-    async def process_tasks(self):
-        """Process tasks from the queue"""
-        while self.status == AgentStatus.RUNNING:
-            try:
-                task = await asyncio.wait_for(self.task_queue.get(), timeout=1.0)
-                logger.info(f"Processing task {task.id} with {self.name}")
-                
-                result = await self.execute_task(task)
-                
-                if result.success:
-                    self.completed_tasks[task.id] = result
-                    logger.info(f"Task {task.id} completed successfully")
-                else:
-                    self.failed_tasks[task.id] = result
-                    logger.error(f"Task {task.id} failed: {result.error}")
-                
-                self.task_queue.task_done()
-                
-            except asyncio.TimeoutError:
-                continue
-            except Exception as e:
-                logger.error(f"Error processing task in {self.name}: {str(e)}")
-                await asyncio.sleep(1)
-    
-    async def run_task_with_smolagents(self, task_description: str, tools: List[Tool] = None) -> Dict[str, Any]:
-        """Run a task using SmolAgents framework"""
+
+def json_object(value):
+    """兼容 final_answer 返回字典或 JSON 文本；拒绝说明性文字。"""
+    if isinstance(value, str):
+        value = value.strip()
+        if value.startswith('```') and value.endswith('```'):
+            value = '\n'.join(value.splitlines()[1:-1])
         try:
-            # Use SmolAgents to run the task
-            result = await self.run(task_description, tools=tools)
-            return {"success": True, "result": result}
-        except Exception as e:
-            logger.error(f"SmolAgents task execution failed: {e}")
-            return {"success": False, "error": str(e)}
-    
-    def add_custom_tool(self, tool: Tool):
-        """Add a custom tool to the agent"""
-        self.tools.append(tool)
-        logger.info(f"Added tool {tool.name} to {self.name}")
-    
-    def get_tools_info(self) -> List[Dict[str, Any]]:
-        """Get information about available tools"""
-        return [
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.parameters if hasattr(tool, 'parameters') else {}
-            }
-            for tool in self.tools
-        ]
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError('Submit the requested JSON object in final_answer.answer, not a status message') from exc
+    if not isinstance(value, dict):
+        raise ValueError('final_answer must contain a JSON object')
+    return value
+
+
+class BaseAgent(ToolCallingAgent):
+    """保留原生工具调用循环；业务校验失败会成为下一步的反馈。"""
+
+    def __init__(self, name, model, memory=None, tools=None, instructions=None):
+        # 每个 Agent 使用框架自己的记忆，避免不同任务共享可变会话。
+        super().__init__(
+            name=name, model=model, tools=tools or [], instructions=instructions,
+            max_steps=12, max_tool_threads=1, verbosity_level=0,
+        )
+        self.observations = []
+        for tool in self.tools.values():
+            if tool.name == 'final_answer':
+                continue
+            forward = tool.forward
+
+            def recorded(*args, _forward=forward, _name=tool.name, **kwargs):
+                # 限制来源工具只能读取用户给定或真实搜索返回的地址。
+                bound = inspect.signature(_forward).bind(*args, **kwargs).arguments
+                targets = bound.get('urls', []) or []
+                if bound.get('url') or bound.get('pdf_path'):
+                    targets = [bound.get('url') or bound.get('pdf_path')]
+                allowed = getattr(self, 'allowed_targets', set())
+                if targets and any(target not in allowed for target in targets):
+                    return {'error': 'Unknown target: discover the URL with search before reading it'}
+                result = _forward(*args, **kwargs)
+                if _name == 'discover_sources' and isinstance(result, dict):
+                    allowed.update(item['url'] for item in result.get('sources', []) if item.get('url'))
+                    self.allowed_targets = allowed
+                if isinstance(result, dict) and not result.get('error'):
+                    items = result.get('extracted_content', [])
+                    if result.get('url') and result.get('content'):
+                        items = [result]
+                    for item in items:
+                        if item.get('url') and item.get('content'):
+                            item['source_id'] = 'source_' + hashlib.sha256(item['url'].encode()).hexdigest()[:12]
+                self.observations.append({'tool': _name, 'result': result})
+                return result
+
+            tool.forward = recorded
+
+    async def run_checked(self, prompt, validator):
+        """在线程中执行 Agent，并拒绝步数耗尽时框架生成的兜底答案。
+
+        Args:
+            prompt: 本次任务、上下文与输出约束。
+            validator: 将 final_answer 校验并转换为业务结果的函数。
+
+        Returns:
+            dict: validator 返回的已校验结果；校验错误抛给调度器。
+        """
+        self.observations.clear()
+
+        def check_answer(answer, memory, agent):
+            validator(json_object(answer))
+            return True
+
+        self.final_answer_checks = [check_answer]
+        result = await asyncio.to_thread(self.run, prompt, return_full_result=True)
+        if result.state != 'success':
+            raise ValueError(f'{self.name}: agent exhausted its step budget without a valid answer')
+        return validator(json_object(result.output))
+
+    async def execute_task(self, task):
+        """兼容任务对象入口；具体输出约束由任务调用方提供。"""
+        try:
+            result = await self.run_checked(task.description, json_object)
+            return TaskResult(task.id, True, result=result)
+        except Exception as exc:
+            return TaskResult(task.id, False, error=str(exc))
+
+    def get_capabilities(self):
+        return [name for name in self.tools if name != 'final_answer']

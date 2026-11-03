@@ -10,7 +10,7 @@ __all__ = [
     "BaseAgent",
     "PlanningAgent",
     "BrowserAgent",
-    "DeepSearchAgent",
+    "DeepResearcherAgent",
     "DeepAnalyzeAgent",
     "FinalAnswerAgent"
 ]
