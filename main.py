@@ -838,13 +838,35 @@ Use concise search queries in parameters.query for research or browser tasks wit
                 discovery = await asyncio.to_thread(
                     SourceDiscoveryTool().forward, query, max_results=10
                 )
+                # 示例（仅展开第一条来源；最多请求 10 条，本次实际返回 8 条）：
+                # discovery = {
+                #     "sources": [{
+                #         "url": "https://www.bbvaresearch.com/en/publicaciones/china-economic-outlook-september-2026/",
+                #         "title": "China Economic Outlook. September 2026",
+                #         "snippet": "The Chinese economy slowed to 4.3% in Q2 2026 … weak consumption, and a housing crisis.",
+                #         "domain": "www.bbvaresearch.com",
+                #         "quality_score": 0.5, "source_type": "all"
+                #     }, ...],
+                #     "total_found": 8,
+                #     "query": "2026 China economic forecast and policy outlook",
+                #     "high_quality_count": 0
+                # }
+
+                # 配置了 trace 时，保存任务 ID、查询词和完整搜索结果，便于排查。
                 if getattr(self, "trace", None):
                     self.trace.record(
                         "search",
                         {"task_id": task["task_id"], "query": query, "result": discovery},
                     )
+                # 记录本轮搜索尝试；结果中没有 error 字段时，get() 返回 None。
                 search_attempts.append({"query": query, "error": discovery.get("error")})
+                # 示例：search_attempts = [
+                #     {"query": "2026 China economic forecast and policy outlook", "error": None}
+                # ]
+
+                # 取出候选来源供后续读取正文；缺少 sources 字段时使用空列表。
                 sources = discovery.get("sources", [])
+                # 示例：sources = discovery["sources"]，本次包含 8 条候选来源，尚未经过正文相关性审查。
 
                 # 从本轮结果中选最多 5 个未在前面查询中尝试过的 URL。
                 # 在提取前加入 seen，因此提取失败的 URL 后续也不会重复尝试。

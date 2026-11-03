@@ -49,57 +49,66 @@ class SourceDiscoveryTool(Tool):
         self.output_type = "object"
     
     def forward(self, query: str, source_type: str = "all", max_results: int = 10) -> Dict[str, Any]:
-        """Discover high-quality sources for financial research (synchronous)"""
+        """同步搜索研究来源，返回地址、标题和搜索摘要，不提取网页正文。"""
         try:
+            # 将查询词、来源类型标记和结果数量上限交给实际搜索方法。
+            # 直接返回其结果；_run_sync 已处理的错误也会作为字典返回。
             return self._run_sync(query, source_type, max_results)
         except Exception as e:
+            # 兜底捕获仍向外抛出的异常，记录日志并返回错误信息。
             logger.error(f"Source discovery failed: {e}")
             return {"error": str(e)}
     
     def _run_sync(self, query: str, source_type: str = "all", max_results: int = 10) -> Dict[str, Any]:
-        """Discover high-quality sources for financial research using SerpAPI"""
+        """通过 SerpAPI 搜索来源，并按域名规则评分；不读取网页正文。"""
         try:
-            # Use SerpAPI for search
+            # 1. 初始化搜索客户端；密钥为空时返回空结果。
             serper_api_key = "b353005664862657b0582ba09c2d987dfbdae60bea06d34b7eec9090127b90d6"
             if not serper_api_key:
                 logger.warning("SERPAPI_API_KEY not set, returning empty results")
                 return {"sources": [], "total_found": 0, "query": query, "high_quality_count": 0}
             
             client = serpapi.Client(api_key=serper_api_key)
+            # 请求 Google 搜索；num 是请求数量，实际返回条数可能不同。
             search_result = client.search({
-                "engine": "google",
-                "q": query,
-                "num": max_results,
+                "engine": "google",  # 搜索引擎。
+                "q": query,  # 搜索词。
+                "num": max_results,  # 期望返回的结果数量。
+                # 查询包含中文时设置中文搜索界面语言，否则使用英文。
                 "hl": "zh-cn" if re.search(r"[\u4e00-\u9fff]", query) else "en",
-                "gl": "us"
+                "gl": "us"  # 搜索地区参数固定为美国，不是来源国家筛选。
             })
             
+            # API 返回错误信息时，转为异常，统一由下面的 except 处理。
             if search_result.get("error"):
                 raise RuntimeError(f"SerpAPI search failed: {search_result['error']}")
 
-            # Parse and filter results
+            # 2. 整理自然搜索结果；当前不按评分过滤或排序。
             sources = []
+            # 预设加分域名列表，仅用于启发式评分，不代表已验证正文质量。
             high_quality_domains = [
                 "bloomberg.com", "reuters.com", "wsj.com", "ft.com", "economist.com",
                 "sec.gov", "yahoo.com", "marketwatch.com", "seekingalpha.com",
                 "morningstar.com", "investopedia.com", "cnbc.com"
             ]
             
+            # 只读取自然搜索结果，不处理广告等其他结果区块。
             organic_results = search_result.get('organic_results', [])
             
             for result in organic_results:
                 url = result.get('link', '')
                 title = result.get('title', '')
-                snippet = result.get('snippet', '')
+                snippet = result.get('snippet', '')  # 搜索引擎摘要，不是网页全文。
                 domain = urlparse(url).netloc.lower()
                 
-                # Quality assessment
+                # 3. 默认评分为 0.5；域名字符串包含任一预设域名时加分至 0.9。
                 quality_score = 0.5
                 for quality_domain in high_quality_domains:
                     if quality_domain in domain:
                         quality_score = 0.9
                         break
                 
+                # 统一字段名；source_type 只作为结果标签，不参与本次搜索过滤。
                 sources.append({
                     "url": url,
                     "title": title,
@@ -111,6 +120,7 @@ class SourceDiscoveryTool(Tool):
             
             logger.info(f"SerpAPI found {len(sources)} sources for query: {query}")
             
+            # 4. 返回来源列表和统计信息；high_quality_count 统计评分达到 0.8 的条数。
             return {
                 "sources": sources,
                 "total_found": len(sources),
@@ -119,6 +129,7 @@ class SourceDiscoveryTool(Tool):
             }
             
         except Exception as e:
+            # 替换错误文本中的 api_key= 参数值，再记录日志并返回空来源及错误。
             error = re.sub(r'(?i)(api_key=)[^&\s)]+', r'\1[REDACTED]', str(e))
             logger.error(f"Source discovery failed: {error}")
             return {"error": error, "sources": [], "total_found": 0}
