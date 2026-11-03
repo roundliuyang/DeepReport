@@ -49,7 +49,7 @@ class SourceDiscoveryTool(Tool):
         self.output_type = "object"
     
     def forward(self, query: str, source_type: str = "all", max_results: int = 10) -> Dict[str, Any]:
-        """同步搜索研究来源，返回地址、标题和搜索摘要，不提取网页正文。"""
+        """同步调用 SerpAPI，返回搜索结果的链接、标题和摘要；网页正文由后续步骤提取。"""
         try:
             # 将查询词、来源类型标记和结果数量上限交给实际搜索方法。
             # 直接返回其结果；_run_sync 已处理的错误也会作为字典返回。
@@ -78,7 +78,37 @@ class SourceDiscoveryTool(Tool):
                 "hl": "zh-cn" if re.search(r"[\u4e00-\u9fff]", query) else "en",
                 "gl": "us"  # 搜索地区参数固定为美国，不是来源国家筛选。
             })
-            
+            # 真实返回示例（仅展示关键字段及第一条结果，其余省略）：
+            # search_result = {
+            #     "search_metadata": {
+            #         "id": "6ae9c55e602a0c84dee18daf",
+            #         "status": "Success"
+            #     },
+            #     "search_parameters": {
+            #         "engine": "google",
+            #         "q": "2026 China economic forecast and policy outlook",
+            #         "hl": "en",
+            #         "gl": "us"
+            #     },
+            #     "search_information": {
+            #         "query_displayed": "2026 China economic forecast and policy outlook",
+            #         "total_results": 144
+            #     },
+            #     "organic_results": [
+            #         {
+            #             "position": 1,
+            #             "title": "China Bulletin: May 5, 2026",
+            #             "link": "https://www.uscc.gov/trade-bulletins/china-bulletin-may-5-2026",
+            #             "displayed_link": "https://www.uscc.gov › trade-bulletins › china-bulletin-...",
+            #             "date": "May 5, 2026",
+            #             "snippet": "According to official figures, China registered 5.0 percent growth in Q1 2026. Closer examination reveals still-weak consumption, ..."
+            #         }
+            #     ]
+            # }
+            # 本次 organic_results 共 8 条；snippet 中的 ... 是搜索引擎原本返回的截断标记。
+            # link 是目标地址，displayed_link 是展示路径；此时尚未读取网页正文。
+            # 后续将 organic_results 整理为 sources：link 改名为 url，另添加域名和评分。
+
             # API 返回错误信息时，转为异常，统一由下面的 except 处理。
             if search_result.get("error"):
                 raise RuntimeError(f"SerpAPI search failed: {search_result['error']}")
