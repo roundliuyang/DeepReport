@@ -525,11 +525,15 @@ Use concise search queries in parameters.query for research or browser tasks wit
         if not tasks:
             raise ValueError("Research plan contains no tasks")
         handlers = {
+            # 资料检索：搜索来源、提取正文并筛选相关内容；两个名称调用同一函数。
             "deep_research": self._execute_deep_research_task,
             "deep_researcher": self._execute_deep_research_task,
+            # 浏览器采集：读取网页/PDF、提取结构化数据或执行表单操作；两个名称等价。
             "browser": self._execute_browser_task,
             "browser_use": self._execute_browser_task,
+            # 研究分析：基于已收集的证据生成分析文档。
             "deep_analyze": self._execute_analysis_task,
+            # 最终写作：综合来源证据和已有分析形成报告正文，HTML 渲染由后续步骤完成。
             "final_answer": self._execute_final_task,
         }
 
@@ -768,41 +772,141 @@ Use concise search queries in parameters.query for research or browser tasks wit
                                     task['description'], items, getattr(self, 'trace', None))
 
     async def _execute_deep_research_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """搜索研究资料，提取正文并筛选相关来源，供后续分析和写作使用。
+
+        Args:
+            task: 检索任务字典，包含 task_id 和 description。
+                parameters.query 可指定搜索词；未提供时使用研究主题。
+                context.research_topic 优先作为主题，为空时使用任务描述。
+
+        Returns:
+            dict: 根据任务是否成功，返回以下两种结构之一。
+
+            成功结果：
+                success: True。
+                task_type: "deep_research"。
+                data: 本次检索收集的数据。
+                    agent_response: 已收集来源数量的文字说明，不是分析正文。
+                    results: 用于展示的来源摘要列表，每项包含：
+                        url: 来源地址。
+                        title: 来源标题。
+                        domain: 来源域名。
+                        snippet: 提取正文的前 300 字符。
+                    structured_data: 供后续分析使用的结构化数据。
+                        sources: 与 results 相同的来源摘要列表。
+                        extracted_content: 通过相关性审查的来源正文列表。
+                        search_attempts: 搜索尝试列表，每项包含 query 和 error。
+                        total_sources: 按 URL 去重后的相关来源数量。
+                        total_content_length: 已采纳正文的总字符数。
+
+            失败结果（try 块内发生异常）：
+                success: False。
+                task_type: "deep_research"。
+                error: 本次任务的异常信息。
+                search_attempts: 失败前已记录的搜索尝试列表。
+
+            注意：失败结果的 search_attempts 位于顶层，不在 data 中；
+            进入 try 前的初始化异常不会在此转换为结果，由上层调度器处理。
+
+        Notes:
+            每次搜索最多请求 10 条结果，从中选取最多 5 个尚未尝试的 URL，
+            每份提取正文最多保留 12000 字符，再交给模型判断相关性。
+            按 URL 去重后累计至少 2 份相关来源即停止补搜；查询耗尽时，
+            只要有 1 份相关来源仍可成功。不同 URL 不保证来自独立机构。
+            本方法只收集证据，不生成分析结论或最终报告。
+        """
         from src.agents.deep_researcher_agent import SourceDiscoveryTool, ContentExtractionTool
-        topic = task.get('context', {}).get('research_topic') or task['description']
-        queries = search_queries(task.get('parameters', {}).get('query') or topic, topic)
+
+        # 1. 确定研究主题，并生成按顺序尝试的查询词（原查询、主题、补充查询）。
+        topic = task.get("context", {}).get("research_topic") or task["description"]
+        queries = search_queries(task.get("parameters", {}).get("query") or topic, topic)
+
+        # seen 记录已选取尝试的 URL；accepted 保存通过相关性审查的正文；
+        # search_attempts 记录每次搜索的查询词及搜索工具返回的错误。
         seen, accepted, search_attempts = set(), [], []
         try:
             for query in queries:
-                discovery = await asyncio.to_thread(SourceDiscoveryTool().forward, query, max_results=10)
-                if getattr(self, 'trace', None):
-                    self.trace.record('search', {'task_id': task['task_id'], 'query': query, 'result': discovery})
-                search_attempts.append({'query': query, 'error': discovery.get('error')})
-                sources = discovery.get('sources', [])
-                urls = [item['url'] for item in sources if item.get('url') and item['url'] not in seen][:5]
+                # 2. 同步搜索工具放在线程中执行，避免阻塞异步事件循环。
+                discovery = await asyncio.to_thread(
+                    SourceDiscoveryTool().forward, query, max_results=10
+                )
+                if getattr(self, "trace", None):
+                    self.trace.record(
+                        "search",
+                        {"task_id": task["task_id"], "query": query, "result": discovery},
+                    )
+                search_attempts.append({"query": query, "error": discovery.get("error")})
+                sources = discovery.get("sources", [])
+
+                # 从本轮结果中选最多 5 个未在前面查询中尝试过的 URL。
+                # 在提取前加入 seen，因此提取失败的 URL 后续也不会重复尝试。
+                urls = [
+                    item["url"]
+                    for item in sources
+                    if item.get("url") and item["url"] not in seen
+                ][:5]
                 seen.update(urls)
                 if not urls:
+                    # 没有可读取的新地址，直接尝试下一组查询词。
                     continue
-                extraction = await asyncio.to_thread(ContentExtractionTool().forward, urls, max_content_length=12000)
-                contents = extraction.get('extracted_content', [])
-                if getattr(self, 'trace', None):
-                    self.trace.record('extraction', {'task_id': task['task_id'], 'content': contents})
+
+                # 3. 提取正文；12000 是每份正文的字符上限，不是所有来源的总上限。
+                extraction = await asyncio.to_thread(
+                    ContentExtractionTool().forward, urls, max_content_length=12000
+                )
+                contents = extraction.get("extracted_content", [])
+                if getattr(self, "trace", None):
+                    self.trace.record(
+                        "extraction", {"task_id": task["task_id"], "content": contents}
+                    )
+
+                # 4. 读取成功不等于内容相关，只累积通过主题相关性审查的来源。
                 accepted.extend(await self._review_sources(task, contents))
-                # A second independent source provides cross-checking; otherwise try a different query.
-                accepted = list({item['url']: item for item in accepted}.values())
+                # 按实际来源 URL 去重；同一 URL 重复出现时保留后一次的内容。
+                accepted = list({item["url"]: item for item in accepted}.values())
                 if len(accepted) >= 2:
+                    # 已有至少两份相关来源，停止补搜；保留本轮通过的全部来源。
                     break
+
+            # 查询耗尽后仍没有相关正文，返回失败，避免让下游基于空证据分析。
             if not accepted:
-                raise ValueError('No relevant research content found after supplementary searches')
-            sources = [{'url': item['url'], 'title': item.get('title', item['url']),
-                        'domain': urlparse(item['url']).netloc, 'snippet': item['content'][:300]} for item in accepted]
-            return {'success': True, 'task_type': 'deep_research', 'data': {
-                'agent_response': f'Collected {len(accepted)} relevant research sources', 'results': sources,
-                'structured_data': {'sources': sources, 'extracted_content': accepted,
-                                    'search_attempts': search_attempts, 'total_sources': len(accepted),
-                                    'total_content_length': sum(len(item['content']) for item in accepted)}}}
+                raise ValueError("No relevant research content found after supplementary searches")
+
+            # 5. 生成便于展示的来源摘要；完整的已提取正文另存于 extracted_content。
+            sources = [
+                {
+                    "url": item["url"],
+                    "title": item.get("title", item["url"]),
+                    "domain": urlparse(item["url"]).netloc,
+                    "snippet": item["content"][:300],
+                }
+                for item in accepted
+            ]
+            return {
+                "success": True,
+                "task_type": "deep_research",
+                "data": {
+                    "agent_response": f"Collected {len(accepted)} relevant research sources",
+                    "results": sources,
+                    "structured_data": {
+                        "sources": sources,
+                        "extracted_content": accepted,
+                        "search_attempts": search_attempts,
+                        "total_sources": len(accepted),
+                        "total_content_length": sum(
+                            len(item["content"]) for item in accepted
+                        ),
+                    },
+                },
+            }
         except Exception as exc:
-            return {'success': False, 'task_type': 'deep_research', 'error': str(exc), 'search_attempts': search_attempts}
+            # 将本任务的异常转成失败结果，交由调度器处理后续依赖任务。
+            return {
+                "success": False,
+                "task_type": "deep_research",
+                "error": str(exc),
+                "search_attempts": search_attempts,
+            }
 
     async def _execute_analysis_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
         return await self._write_research_task(task, "analysis")
