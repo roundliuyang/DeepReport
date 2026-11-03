@@ -124,7 +124,70 @@ class DeepReportApp:
                 'output_format': output_format, 'current_date': datetime.now().date().isoformat(),
             }, ensure_ascii=False), lambda value: validate_plan(value, user_text))
             plan.update(research_topic=research_topic, requirements=requirements_list)
+            # plan 完整示例（JSON）：
+            # {
+            #     "overview": "This research plan outlines a systematic approach to analyze the 2026 outlook for China's economy and its prospects, adhering to the given requirements to produce an HTML report.",
+            #     "tasks": [
+            #         {
+            #             "task_id": "task_001",
+            #             "task_type": "deep_researcher",
+            #             "description": "Gather background information on China's economic outlook for 2026.",
+            #             "parameters": {
+            #                 "query": "2026年中国经济展望"
+            #             },
+            #             "dependencies": []
+            #         },
+            #         {
+            #             "task_id": "task_002",
+            #             "task_type": "deep_researcher",
+            #             "description": "Investigate economic growth predictions for China's key industries in 2026.",
+            #             "parameters": {
+            #                 "query": "2026年中国主要行业经济增长预测"
+            #             },
+            #             "dependencies": []
+            #         },
+            #         {
+            #             "task_id": "task_003",
+            #             "task_type": "deep_researcher",
+            #             "description": "Research challenges and opportunities for China's economy in 2026.",
+            #             "parameters": {
+            #                 "query": "2026年中国经济挑战与机遇"
+            #             },
+            #             "dependencies": []
+            #         },
+            #         {
+            #             "task_id": "task_004",
+            #             "task_type": "deep_analyze",
+            #             "description": "Analyze collected research to evaluate whether China's economy is promising in 2026.",
+            #             "parameters": {
+            #                 "query": "Aggregate findings from tasks 001, 002, and 003 to assess 2026 Chinese economy prospects."
+            #             },
+            #             "dependencies": [
+            #                 "task_001",
+            #                 "task_002",
+            #                 "task_003"
+            #             ]
+            #         },
+            #         {
+            #             "task_id": "task_005",
+            #             "task_type": "final_answer",
+            #             "description": "Compile the final HTML report summarizing insights on the 2026 outlook for China's economy and prospects.",
+            #             "parameters": {
+            #                 "query": "Use results from task 004 to create a comprehensive HTML report."
+            #             },
+            #             "dependencies": [
+            #                 "task_004"
+            #             ]
+            #         }
+            #     ],
+            #     "expected_output": "html report summarizing China's 2026 economic outlook and prospects.",
+            #     "research_topic": "2026 中国经济展望与是否看好",
+            #     "requirements": [
+            #         "洞察力"
+            #     ]
+            # }
             record('plan', plan)
+
             results = await self._execute_research_plan(plan, model, supplied_targets(user_text), record)
             failed = {key: value.get('error') for key, value in results.items() if not value.get('success')}
             if failed:
@@ -161,6 +224,8 @@ class DeepReportApp:
         """
         validate_plan(plan, '\n'.join(allowed_targets or []))
         pending = {task['task_id']: task for task in plan['tasks']}
+        # 按 task_id 保存已处理任务的结果，包括成功、执行失败和依赖失败后跳过的任务。
+        # 下游先检查依赖是否已在 results 中，再检查其 success，决定执行还是跳过。
         results = {}
         tasks = dict(pending)
         semaphore = asyncio.Semaphore(2)
@@ -172,24 +237,34 @@ class DeepReportApp:
             return deps
 
         async def execute(task):
+            # 当前任务已进入 ready，所有直接依赖都已在 results 中，无需再等待。
             key = task['task_id']
             failed = [dep for dep in task['dependencies'] if not results[dep]['success']]
             if failed:
+                # 前置任务失败时，不调用 Agent；返回失败原因，让后续依赖此任务的任务也能跳过。
                 return key, {'success': False, 'error': f'Failed dependencies: {failed}',
                              'task_type': TASK_TYPES[task['task_type']]}
+            # 浅拷贝任务，再添加 context，避免修改原计划中的任务字典。
             prepared = dict(task)
             prepared['context'] = {
                 'research_topic': plan['research_topic'], 'requirements': plan['requirements'],
+                # 传入直接和间接依赖的已有结果，供 Agent 使用上游证据；不混入无关任务结果。
                 'task_results': {dep: result for dep, result in results.items() if dep in dependencies_of(key)},
             }
+            # 获取执行名额；最多同时运行两个任务，其他任务等待，退出此代码块时自动释放名额。
             async with semaphore:
                 try:
+                    # 根据任务类型调用对应 Agent，传入上下文、模型、允许读取的目标及记录函数。
                     value = await self._execute_agent_task(prepared, model, allowed_targets or set(), record)
                 except Exception as exc:
+                    # 将执行异常转为失败结果，避免中断同批其他任务；下游会据此判断是否跳过。
                     value = {'success': False, 'task_type': TASK_TYPES[task['task_type']], 'error': str(exc)}
+            # 返回任务 ID 和结果，由外层收齐本批结果后写入 results，并从 pending 移除。
             return key, value
 
         while pending:
+            # 筛选所有前置任务都已有结果的待处理任务，进入本轮处理；无依赖的任务也会入选。
+            # 此处只判断是否还需等待；execute() 再检查依赖是否成功，决定执行 Agent 还是跳过。
             ready = [t for t in pending.values() if all(d in results for d in t['dependencies'])]
             if not ready:
                 raise ValueError('Research plan contains a dependency cycle')
@@ -213,6 +288,8 @@ class DeepReportApp:
         """
         kind = TASK_TYPES[task['task_type']]
         if kind in ('deep_researcher', 'browser'):
+            # 资料采集分支：deep_researcher → DeepResearcherAgent（搜索、提取正文）；
+            # browser → BrowserAgent（读取网页或 PDF）。两者均返回来源与正文证据。
             agent = (DeepResearcherAgent if kind == 'deep_researcher' else BrowserAgent)(self._new_model(model))
             evidence = ResearchEvidence.collect_evidence(task)
             agent.allowed_targets = set(allowed_targets) | set(evidence)
@@ -228,6 +305,8 @@ class DeepReportApp:
                 'exact_target': exact, 'current_date': datetime.now().date().isoformat(),
             }, ensure_ascii=False)
         else:
+            # 分析与写作分支：analysis → DeepAnalyzeAgent（基于证据分析）；
+            # final → FinalAnswerAgent（汇总上游分析，撰写最终报告正文）。
             evidence = ResearchEvidence.collect_evidence(task)
             if not evidence:
                 raise ValueError('No extracted evidence is available for analysis')
