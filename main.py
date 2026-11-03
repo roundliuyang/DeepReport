@@ -821,9 +821,17 @@ Use concise search queries in parameters.query for research or browser tasks wit
         topic = task.get("context", {}).get("research_topic") or task["description"]
         queries = search_queries(task.get("parameters", {}).get("query") or topic, topic)
 
-        # seen 记录已选取尝试的 URL；accepted 保存通过相关性审查的正文；
-        # search_attempts 记录每次搜索的查询词及搜索工具返回的错误。
-        seen, accepted, search_attempts = set(), [], []
+        # 示例：
+        # topic = "2026 中国经济展望及是否看好"
+        # queries = [
+        #     "2026 China economic forecast and policy outlook",
+        #     "2026 中国经济展望及是否看好",
+        #     "2026 中国经济展望及是否看好 (site:imf.org OR site:worldbank.org)",
+        # ]
+
+        seen = set()  # 已尝试的 URL，用于避免重复读取。
+        accepted = []  # 通过相关性审查的来源正文。
+        search_attempts = []  # 每次搜索的查询词及错误信息。
         try:
             for query in queries:
                 # 2. 同步搜索工具放在线程中执行，避免阻塞异步事件循环。
